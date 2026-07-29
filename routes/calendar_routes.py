@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import datetime, date, timedelta
 from typing import Optional, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -207,6 +208,7 @@ class EventCreate(BaseModel):
     calendar_href: Optional[str] = None  # calendar id
     rrule: Optional[str] = None
     color: Optional[str] = None  # per-event color override
+    timezone: Optional[str] = None  # browser/source IANA zone
 
 
 class EventUpdate(BaseModel):
@@ -218,6 +220,7 @@ class EventUpdate(BaseModel):
     location: Optional[str] = None
     rrule: Optional[str] = None
     color: Optional[str] = None
+    timezone: Optional[str] = None
 
 
 # ── Helpers ──
@@ -238,6 +241,17 @@ def _ensure_default_calendar(db, owner: str = None) -> CalendarCal:
         db.commit()
         db.refresh(cal)
     return cal
+
+
+def _validated_event_timezone(value: object) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    try:
+        ZoneInfo(candidate)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise HTTPException(400, "Invalid event timezone") from exc
+    return candidate
 
 
 # Per-request user time context. chat_routes sets this from browser timezone
@@ -541,6 +555,7 @@ def _event_to_dict(ev: CalendarEvent) -> dict:
         "dtend": end_str,
         "all_day": ev.all_day,
         "is_utc": bool(getattr(ev, "is_utc", False)),
+        "timezone": getattr(ev, "timezone_name", "") or "",
         "description": ev.description or "",
         "location": ev.location or "",
         "rrule": ev.rrule or "",
@@ -747,6 +762,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         account["oauth_access_token"] = ""
         account["oauth_refresh_token"] = ""
         account["oauth_expires_at"] = 0
+        account["oauth_scope"] = ""
 
     # ── CalDAV config routes (backward-compat single-account API) ────────────
 
@@ -813,6 +829,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         owner = _require_user(request)
         accounts = _get_caldav_accounts(owner)
         from src.secret_storage import decrypt
+        from src.google_oauth import has_calendar_write_scope
 
         def _has_secret(
             value, account_id: str, field: str, *, allow_plaintext: bool = False
@@ -833,7 +850,13 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             auth_type = acc.get("auth_type") or "basic"
             if auth_type == "oauth2_google":
                 has_token = _has_secret(acc.get("oauth_access_token"), acc.get("id", ""), "access token")
-                is_connected = _has_secret(acc.get("oauth_refresh_token"), acc.get("id", ""), "refresh token")
+                has_current_scope = has_calendar_write_scope(acc.get("oauth_scope"))
+                has_refresh_token = _has_secret(
+                        acc.get("oauth_refresh_token"),
+                        acc.get("id", ""),
+                        "refresh token",
+                )
+                is_connected = has_token and has_refresh_token
                 safe.append({
                     "id": acc.get("id", ""),
                     "label": acc.get("label", "") or acc.get("url", ""),
@@ -843,6 +866,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     "auth_type": "oauth2_google",
                     "has_access_token": has_token,
                     "is_connected": is_connected,
+                    "needs_reconnect": is_connected and not has_current_scope,
                     # Client ID is not a secret and is needed to edit or
                     # reconnect an existing account.  Never return the
                     # encrypted client secret or bearer tokens.
@@ -962,7 +986,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                 if auth_type == "oauth2_google"
                 else (
                     "oauth_client_id", "oauth_client_secret", "oauth_access_token",
-                    "oauth_refresh_token", "oauth_expires_at",
+                    "oauth_refresh_token", "oauth_expires_at", "oauth_scope",
                 )
             )
             for key in stale:
@@ -1067,7 +1091,13 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                 "<a href='/'>Back to Odysseus</a></body></html>",
                 status_code=400,
             )
-        from src.google_oauth import consume_state, exchange_code, get_redirect_uri
+        from src.google_oauth import (
+            consume_state,
+            exchange_code,
+            get_redirect_uri,
+            has_calendar_write_scope,
+            revoke_token,
+        )
         pending = consume_state(state, owner=owner)
         if not pending:
             return HTMLResponse(
@@ -1197,8 +1227,34 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     "<a href='/'>Back to Odysseus</a></body></html>",
                     status_code=400,
                 )
+        granted_scope = str(tokens.get("scope") or "")
+        if not has_calendar_write_scope(granted_scope):
+            try:
+                await revoke_token(
+                    str(returned_refresh_token or tokens.get("access_token") or "")
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not revoke rejected Google grant for account %s: %s",
+                    account_id,
+                    type(exc).__name__,
+                )
+            acc["oauth_access_token"] = ""
+            acc["oauth_refresh_token"] = ""
+            acc["oauth_expires_at"] = 0
+            acc["oauth_scope"] = granted_scope
+            accounts[idx] = acc
+            _save_caldav_accounts(owner, accounts)
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google Calendar read/write access was not granted</h2>"
+                "<p>Please reconnect and allow the requested Calendar permission.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=403,
+            )
         acc["oauth_access_token"] = encrypt(tokens["access_token"])
         acc["oauth_expires_at"] = tokens["expires_at"]
+        acc["oauth_scope"] = granted_scope
         accounts[idx] = acc
         _save_caldav_accounts(owner, accounts)
         return HTMLResponse(
@@ -1531,6 +1587,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                 dtend=dtend,
                 all_day=data.all_day,
                 is_utc=_is_utc and not data.all_day,
+                timezone_name=_validated_event_timezone(data.timezone),
                 rrule=data.rrule or "",
                 color=data.color or None,
                 caldav_sync_pending="create" if cal.source == "caldav" else None,
@@ -1583,6 +1640,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     ev.is_utc = False  # all-day stays date-only
             if data.rrule is not None:
                 ev.rrule = data.rrule
+            if data.timezone is not None:
+                ev.timezone_name = _validated_event_timezone(data.timezone)
             if data.color is not None:
                 ev.color = data.color if data.color else None
             is_caldav = ev.calendar and ev.calendar.source == "caldav"
@@ -1788,6 +1847,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                 # the bug where imported events fire reminders at wrong times.
                 from datetime import timezone as _tz
                 row_is_utc = False
+                row_timezone = ""
                 if all_day:
                     start_dt = datetime(dt_val.year, dt_val.month, dt_val.day)
                     dtend = comp.get("dtend")
@@ -1796,6 +1856,11 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     if hasattr(dt_val, 'tzinfo') and dt_val.tzinfo is not None:
                         start_dt = dt_val.astimezone(_tz.utc).replace(tzinfo=None)
                         row_is_utc = True
+                        row_timezone = str(
+                            dtstart.params.get("TZID")
+                            or getattr(dt_val.tzinfo, "key", "")
+                            or ""
+                        )
                     else:
                         start_dt = dt_val
                     dtend = comp.get("dtend")
@@ -1820,6 +1885,7 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                     dtend=end_dt,
                     all_day=all_day,
                     is_utc=row_is_utc,
+                    timezone_name=row_timezone,
                     rrule=(comp.get("rrule").to_ical().decode() if comp.get("rrule") else ""),
                 )
                 db.add(ev)

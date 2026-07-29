@@ -249,18 +249,22 @@ function _optimisticEvent(data, uid) {
 // All three flows now inspect `r.ok` and roll back the optimistic
 // state + surface a toast on the failure path.
 async function _createEvent(data) {
+  const payload = {
+    ...data,
+    timezone: data.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+  };
   const tempUid = 'temp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-  _allEvents[tempUid] = _optimisticEvent(data, tempUid);
+  _allEvents[tempUid] = _optimisticEvent(payload, tempUid);
   fetch(`${API_BASE}/api/calendar/events`, {
     method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   }).then(async r => {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).then(d => {
     if (d.uid) {
       delete _allEvents[tempUid];
-      _allEvents[d.uid] = _optimisticEvent(data, d.uid);
+      _allEvents[d.uid] = _optimisticEvent(payload, d.uid);
       _saveCache && _saveCache();
       if (_open) _render();
     }
@@ -273,7 +277,16 @@ async function _createEvent(data) {
 }
 
 async function _updateEvent(uid, data) {
-  const merged = { ...(_allEvents[uid] || {}), ...data };
+  const payload = { ...data };
+  const changesTime = (
+    data.dtstart !== undefined
+    || data.dtend !== undefined
+    || data.all_day !== undefined
+  );
+  if (changesTime && !payload.timezone) {
+    payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  }
+  const merged = { ...(_allEvents[uid] || {}), ...payload };
   const _preMergeBackup = _allEvents[uid];
   _allEvents[uid] = _optimisticEvent(merged, uid);
   // For recurring events the uid is a compound "{base_uid}::{date}" —
@@ -283,7 +296,7 @@ async function _updateEvent(uid, data) {
   const isRecurring = uid.includes('::');
   fetch(`${API_BASE}/api/calendar/events/${encodeURIComponent(uid)}`, {
     method: 'PUT', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   }).then(r => {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     if (isRecurring) {

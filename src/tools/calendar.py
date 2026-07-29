@@ -28,7 +28,9 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
         _resolve_base_uid,
         _push_caldav_event_after_commit,
         _record_caldav_delete_tombstone,
+        _validated_event_timezone,
     )
+    from src.user_time import get_user_tz_name
     import uuid as _uuid
 
     try:
@@ -431,6 +433,9 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
                 location=event_location,
                 dtstart=dtstart, dtend=dtend, all_day=all_day,
                 is_utc=dtstart_is_utc and not all_day,
+                timezone_name=_validated_event_timezone(
+                    args.get("timezone") or get_user_tz_name() or ""
+                ),
                 rrule=args.get("rrule", "") or "",
                 event_type=event_type,
                 importance=importance,

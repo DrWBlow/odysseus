@@ -23,6 +23,7 @@ def test_event_to_ical_serializes_core_fields_and_rrule():
         "all_day": False,
         "is_utc": False,
         "rrule": "FREQ=WEEKLY;COUNT=2",
+        "recurrence_exdates": ["2026-06-12T09:00"],
     })
 
     assert "UID:evt-123" in ical
@@ -30,6 +31,7 @@ def test_event_to_ical_serializes_core_fields_and_rrule():
     assert "DESCRIPTION:Bring notes" in ical
     assert "LOCATION:HQ" in ical
     assert "RRULE:FREQ=WEEKLY;COUNT=2" in ical
+    assert "EXDATE:20260612T090000" in ical
 
 
 def test_caldav_pull_prune_skips_unsynced_or_pending_local_rows():
@@ -83,6 +85,7 @@ def test_database_declares_and_migrates_caldav_remote_metadata():
 
 
 def test_failed_remote_delete_leaves_tombstone_and_later_retry_cleans_up(tmp_path, monkeypatch):
+    import src.caldav_sync as caldav_sync
     import src.caldav_writeback as writeback
 
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'calendar.db'}")
@@ -106,12 +109,15 @@ def test_failed_remote_delete_leaves_tombstone_and_later_retry_cleans_up(tmp_pat
             caldav_base_url="https://caldav.example/calendars/alice/main/",
         )
         ev = CalendarEvent(
-            uid="evt-delete",
+            uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098",
             calendar_id=cal.id,
             summary="Delete me",
             dtstart=datetime(2026, 6, 5, 9, 0),
             dtend=datetime(2026, 6, 5, 10, 0),
-            remote_href="https://caldav.example/calendars/alice/main/evt-delete.ics",
+            remote_href=(
+                "https://www.googleapis.com/calendar/v3/calendars/"
+                "person%40example.com/events/google-created-1"
+            ),
         )
         session.add(cal)
         session.add(ev)
@@ -130,24 +136,43 @@ def test_failed_remote_delete_leaves_tombstone_and_later_retry_cleans_up(tmp_pat
         session.delete(ev)
         session.commit()
 
-        assert session.query(CalendarEvent).filter_by(uid="evt-delete").first() is None
-        tombstone = session.query(CalendarDeletedEvent).filter_by(uid="evt-delete").first()
+        assert (
+            session.query(CalendarEvent)
+            .filter_by(uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098")
+            .first()
+            is None
+        )
+        tombstone = (
+            session.query(CalendarDeletedEvent)
+            .filter_by(uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098")
+            .first()
+        )
         assert tombstone is not None
-        assert tombstone.remote_href.endswith("evt-delete.ics")
+        assert tombstone.remote_href.endswith("/events/google-created-1")
     finally:
         session.close()
+
+    loaded = caldav_sync._load_delete_for_writeback(
+        "alice", "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    )
+    assert loaded is not None
+    assert loaded[2]["remote_href"].endswith("/events/google-created-1")
 
     writeback._persist_writeback_result(
         "alice",
         "caldav-test",
-        "evt-delete",
+        "5b1d4e9c-9254-4edc-a9a2-e9136c67f098",
         {"ok": False, "error": "temporary remote delete failure"},
         delete=True,
     )
 
     session = TestingSessionLocal()
     try:
-        tombstone = session.query(CalendarDeletedEvent).filter_by(uid="evt-delete").first()
+        tombstone = (
+            session.query(CalendarDeletedEvent)
+            .filter_by(uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098")
+            .first()
+        )
         assert tombstone is not None
         assert "temporary remote delete failure" in tombstone.last_error
     finally:
@@ -156,14 +181,86 @@ def test_failed_remote_delete_leaves_tombstone_and_later_retry_cleans_up(tmp_pat
     writeback._persist_writeback_result(
         "alice",
         "caldav-test",
-        "evt-delete",
+        "5b1d4e9c-9254-4edc-a9a2-e9136c67f098",
         {"ok": True},
         delete=True,
     )
 
     session = TestingSessionLocal()
     try:
-        assert session.query(CalendarDeletedEvent).filter_by(uid="evt-delete").first() is None
-        assert session.query(CalendarEvent).filter_by(uid="evt-delete").first() is None
+        assert (
+            session.query(CalendarDeletedEvent)
+            .filter_by(uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098")
+            .first()
+            is None
+        )
+        assert (
+            session.query(CalendarEvent)
+            .filter_by(uid="5b1d4e9c-9254-4edc-a9a2-e9136c67f098")
+            .first()
+            is None
+        )
+    finally:
+        session.close()
+
+
+def test_google_conflict_clears_pending_so_pull_can_converge(
+    tmp_path, monkeypatch
+):
+    import src.caldav_writeback as writeback
+
+    monkeypatch.setenv(
+        "DATABASE_URL", f"sqlite:///{tmp_path / 'calendar-conflict.db'}"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "core.database", Path("core/database.py")
+    )
+    dbmod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "core.database", dbmod)
+    spec.loader.exec_module(dbmod)
+
+    session = dbmod.SessionLocal()
+    try:
+        calendar = dbmod.CalendarCal(
+            id="caldav-google",
+            owner="alice",
+            name="Google",
+            source="caldav",
+        )
+        event = dbmod.CalendarEvent(
+            uid="evt-conflict",
+            calendar_id=calendar.id,
+            summary="Keep pending",
+            dtstart=datetime(2026, 6, 5, 9, 0),
+            dtend=datetime(2026, 6, 5, 10, 0),
+            remote_href="https://www.googleapis.com/calendar/v3/calendars/a/events/b",
+            remote_etag='"stale"',
+            caldav_sync_pending="update",
+        )
+        session.add(calendar)
+        session.add(event)
+        session.commit()
+    finally:
+        session.close()
+
+    writeback._persist_writeback_result(
+        "alice",
+        "caldav-google",
+        "evt-conflict",
+        {
+            "ok": False,
+            "conflict": True,
+            "error": "Google Calendar event changed during update",
+        },
+        delete=False,
+    )
+
+    session = dbmod.SessionLocal()
+    try:
+        event = session.query(dbmod.CalendarEvent).filter_by(
+            uid="evt-conflict"
+        ).one()
+        assert event.caldav_sync_pending is None
+        assert event.remote_etag is None
     finally:
         session.close()

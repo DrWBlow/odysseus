@@ -1,6 +1,7 @@
 """Deterministic Google OAuth and direct CalDAV REPORT regressions."""
 
 import asyncio
+import hashlib
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -38,7 +39,10 @@ def test_redirect_uri_default_and_explicit_override(monkeypatch):
 
     auth_url = google_oauth.build_auth_url("client", override, "state")
     assert parse_qs(urlparse(auth_url).query)["scope"] == [google_oauth.CALDAV_SCOPE]
-    assert google_oauth.CALDAV_SCOPE.endswith("/calendar.readonly")
+    assert set(google_oauth.CALDAV_SCOPE.split()) == {
+        google_oauth.CALENDAR_EVENTS_SCOPE,
+        google_oauth.CALENDAR_LIST_SCOPE,
+    }
 
 
 def test_oauth_state_is_bound_single_use_and_expires_without_sleep(monkeypatch):
@@ -111,8 +115,21 @@ class _FakeAsyncClient:
 def test_exchange_and_refresh_payloads_and_expiry(monkeypatch):
     _FakeAsyncClient.calls = []
     _FakeAsyncClient.responses = [
-        _FakeAsyncResponse({"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600}),
-        _FakeAsyncResponse({"access_token": "access-2", "expires_in": 1800}),
+        _FakeAsyncResponse(
+            {
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "expires_in": 3600,
+                "scope": google_oauth.CALDAV_SCOPE,
+            }
+        ),
+        _FakeAsyncResponse(
+            {
+                "access_token": "access-2",
+                "expires_in": 1800,
+                "scope": google_oauth.CALDAV_SCOPE,
+            }
+        ),
     ]
     monkeypatch.setattr(google_oauth.httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(google_oauth.time, "time", lambda: 1000.9)
@@ -128,8 +145,13 @@ def test_exchange_and_refresh_payloads_and_expiry(monkeypatch):
         "access_token": "access-1",
         "refresh_token": "refresh-1",
         "expires_at": 4540,
+        "scope": google_oauth.CALDAV_SCOPE,
     }
-    assert refreshed == {"access_token": "access-2", "expires_at": 2740}
+    assert refreshed == {
+        "access_token": "access-2",
+        "expires_at": 2740,
+        "scope": google_oauth.CALDAV_SCOPE,
+    }
     assert _FakeAsyncClient.calls == [
         {
             "url": google_oauth.GOOGLE_TOKEN_URL,
@@ -320,11 +342,17 @@ def test_google_report_serializes_explicit_utc_boundaries(monkeypatch):
 
 
 class _FakeGoogleApiResponse:
-    def __init__(self, data):
+    def __init__(self, data, status_code=200):
         self._data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            request = httpx.Request("GET", "https://www.googleapis.com/")
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError(
+                "Google API failure", request=request, response=response
+            )
 
     def json(self):
         return self._data
@@ -377,6 +405,11 @@ def test_google_calendar_api_fetches_readonly_feeds_and_expands_recurrences(monk
                             "dateTime": "2026-07-29T13:30:00",
                             "timeZone": "Europe/Zurich",
                         },
+                        "extendedProperties": {
+                            "private": {
+                                "odysseus_uid": "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+                            }
+                        },
                     },
                     {
                         "id": "cancelled-event",
@@ -414,6 +447,8 @@ def test_google_calendar_api_fetches_readonly_feeds_and_expands_recurrences(monk
     assert len(feeds[0].icals) == 1
     assert len(feeds[1].icals) == 1
     assert "cancelled-event" not in feeds[0].icals[0]
+    assert "UID:5b1d4e9c-9254-4edc-a9a2-e9136c67f098" in feeds[0].icals[0]
+    assert feeds[0].resources[0].url.endswith("/events/timed-event")
 
     list_call, holiday_call, personal_call = _FakeGoogleApiClient.calls
     assert list_call["url"].endswith("/users/me/calendarList")
@@ -424,11 +459,164 @@ def test_google_calendar_api_fetches_readonly_feeds_and_expands_recurrences(monk
         "/calendars/person%40example.com/events"
     )
     assert holiday_call["params"]["singleEvents"] == "true"
+    assert holiday_call["params"]["showDeleted"] == "true"
     assert holiday_call["params"]["timeMin"] == "2026-07-01T00:00:00Z"
     assert all(
         call["headers"]["Authorization"] == "Bearer read-only-token"
         for call in _FakeGoogleApiClient.calls
     )
+
+
+def test_google_event_tolerates_malformed_private_properties():
+    ical = caldav_sync._google_event_to_ical(
+        "person@example.com",
+        {
+            "id": "event-1",
+            "start": {"date": "2026-08-01"},
+            "end": {"date": "2026-08-02"},
+            "extendedProperties": {"private": ["not", "an", "object"]},
+        },
+    )
+
+    expected_hash = hashlib.sha256(b"person@example.com").hexdigest()[:16]
+    assert f"UID:google-{expected_hash}-event-1" in ical
+
+
+def test_google_reconcile_series_keeps_master_and_moved_exception():
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    master = {
+        "id": "master",
+        "summary": "Series",
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00"},
+        "recurrence": ["RRULE:FREQ=DAILY"],
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    regular = {
+        "id": "master_20260802T070000Z",
+        "recurringEventId": "master",
+        "summary": "Series",
+        "originalStartTime": {
+            "dateTime": "2026-08-02T09:00:00+02:00"
+        },
+        "start": {"dateTime": "2026-08-02T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-02T10:00:00+02:00"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    moved = {
+        "id": "master_20260803T070000Z",
+        "recurringEventId": "master",
+        "summary": "Series moved",
+        "originalStartTime": {
+            "dateTime": "2026-08-03T09:00:00+02:00"
+        },
+        "start": {"dateTime": "2026-08-03T11:00:00+02:00"},
+        "end": {"dateTime": "2026-08-03T12:00:00+02:00"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    _FakeGoogleApiClient.calls = []
+    _FakeGoogleApiClient.responses = [_FakeGoogleApiResponse(master)]
+    client = _FakeGoogleApiClient()
+
+    reconciled = caldav_sync._google_reconcile_odysseus_series(
+        client,
+        {"Authorization": "Bearer token"},
+        "person@example.com",
+        [regular, moved],
+    )
+
+    assert [item["id"] for item in reconciled] == [
+        "master",
+        "master_20260803T070000Z",
+    ]
+    assert reconciled[0]["recurrence"] == [
+        "RRULE:FREQ=DAILY",
+        "EXDATE:20260803T070000Z",
+    ]
+    assert reconciled[1]["_odysseus_recurrence_exception"] is True
+    master_ical = caldav_sync._google_event_to_ical(
+        "person@example.com", reconciled[0]
+    )
+    assert "EXDATE:20260803T070000Z" in master_ical
+
+
+def test_google_reconcile_series_preserves_instances_when_master_lookup_fails():
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    instance = {
+        "id": "master_20260802T070000Z",
+        "recurringEventId": "master",
+        "summary": "Series",
+        "start": {"dateTime": "2026-08-02T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-02T10:00:00+02:00"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    _FakeGoogleApiClient.responses = [
+        _FakeGoogleApiResponse({}, status_code=503)
+    ]
+
+    reconciled = caldav_sync._google_reconcile_odysseus_series(
+        _FakeGoogleApiClient(),
+        {"Authorization": "Bearer token"},
+        "person@example.com",
+        [instance],
+    )
+
+    assert reconciled == [instance]
+
+
+def test_google_duration_only_change_is_a_recurrence_exception():
+    master = {
+        "summary": "Series",
+        "start": {"dateTime": "2026-08-01T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-01T10:00:00+02:00"},
+    }
+    shortened = {
+        "summary": "Series",
+        "originalStartTime": {
+            "dateTime": "2026-08-02T09:00:00+02:00"
+        },
+        "start": {"dateTime": "2026-08-02T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-02T09:30:00+02:00"},
+    }
+
+    assert caldav_sync._google_instance_is_exception(shortened, master)
+
+
+def test_google_exdate_merge_refreshes_only_current_sync_window():
+    merged = caldav_sync._merge_google_recurrence_exdates(
+        '["2026-05-01T07:00", "2026-08-03T07:00"]',
+        ["2026-08-04T07:00"],
+        datetime(2026, 7, 1),
+        datetime(2027, 7, 1),
+    )
+
+    assert merged == ["2026-05-01T07:00", "2026-08-04T07:00"]
+
+
+def test_google_unknown_timezone_is_reported_as_malformed_event():
+    with pytest.raises(ValueError, match="unknown time zone"):
+        caldav_sync._google_event_to_ical(
+            "person@example.com",
+            {
+                "id": "bad-zone",
+                "start": {
+                    "dateTime": "2026-08-01T09:00:00",
+                    "timeZone": "Legacy/Unknown",
+                },
+                "end": {
+                    "dateTime": "2026-08-01T10:00:00",
+                    "timeZone": "Legacy/Unknown",
+                },
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -467,6 +655,7 @@ def test_refresh_does_not_write_after_delayed_account_mutation(
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
         "oauth_refresh_token": "enc:refresh",
@@ -493,6 +682,101 @@ def test_refresh_does_not_write_after_delayed_account_mutation(
     assert writes == []
 
 
+def test_old_readonly_grant_requires_reconnect_before_token_use():
+    account = {
+        "id": "google-1",
+        "auth_type": "oauth2_google",
+        "oauth_scope": "https://www.googleapis.com/auth/calendar.readonly",
+        "oauth_access_token": "unused",
+        "oauth_expires_at": 9999999999,
+    }
+
+    with pytest.raises(ValueError, match="permissions changed"):
+        asyncio.run(
+            caldav_sync.ensure_google_access_token("alice", "google-1", account)
+        )
+
+
+def test_legacy_grant_without_scope_can_continue_pull_only(monkeypatch):
+    monkeypatch.setattr(secret_storage, "decrypt", lambda value: value or "")
+    account = {
+        "id": "google-1",
+        "auth_type": "oauth2_google",
+        "oauth_access_token": "legacy-read-token",
+        "oauth_expires_at": 9999999999,
+    }
+
+    token, _current = asyncio.run(
+        caldav_sync.ensure_google_access_token(
+            "alice",
+            "google-1",
+            account,
+            require_write=False,
+        )
+    )
+
+    assert token == "legacy-read-token"
+
+
+def test_scope_helper_accepts_authoritative_multi_scope_response():
+    granted = f"openid {google_oauth.CALDAV_SCOPE}"
+    assert google_oauth.has_calendar_write_scope(granted)
+    assert google_oauth.has_calendar_write_scope(google_oauth.CALENDAR_FULL_SCOPE)
+    assert google_oauth.has_calendar_write_scope(
+        f"{google_oauth.CALENDAR_EVENTS_SCOPE} "
+        f"{google_oauth.CALENDAR_LIST_WRITE_SCOPE}"
+    )
+    assert google_oauth.has_calendar_write_scope(
+        f"{google_oauth.CALENDAR_EVENTS_SCOPE} "
+        f"{google_oauth.CALENDAR_READ_SCOPE}"
+    )
+    assert not google_oauth.has_calendar_write_scope(
+        "https://www.googleapis.com/auth/calendar.readonly"
+    )
+
+
+def test_refresh_reduced_scope_clears_tokens_and_requires_reconnect(monkeypatch):
+    monkeypatch.setattr(secret_storage, "decrypt", lambda value: value or "")
+    monkeypatch.setattr(secret_storage, "encrypt", lambda value: f"enc:{value}")
+    account = {
+        "id": "google-1",
+        "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
+        "oauth_client_id": "client",
+        "oauth_client_secret": "enc:secret",
+        "oauth_refresh_token": "enc:refresh",
+        "oauth_access_token": "enc:old-access",
+        "oauth_expires_at": 0,
+    }
+    latest = dict(account)
+    writes = []
+
+    async def reduced_refresh(*args):
+        return {
+            "access_token": "readonly",
+            "expires_at": 2000,
+            "scope": "https://www.googleapis.com/auth/calendar.readonly",
+        }
+
+    monkeypatch.setattr(google_oauth, "refresh_access_token", reduced_refresh)
+    monkeypatch.setattr(caldav_sync, "_load_caldav_accounts", lambda owner: [latest])
+    monkeypatch.setattr(
+        caldav_sync,
+        "save_caldav_accounts",
+        lambda owner, accounts: writes.append((owner, accounts)),
+    )
+
+    with pytest.raises(ValueError, match="permissions changed"):
+        asyncio.run(
+            caldav_sync.ensure_google_access_token("alice", "google-1", account)
+        )
+    saved = writes[0][1][0]
+    assert saved["oauth_scope"].endswith("/calendar.readonly")
+    assert saved["oauth_access_token"] == ""
+    assert saved["oauth_refresh_token"] == ""
+    assert saved["oauth_expires_at"] == 0
+
+
 @pytest.mark.parametrize("error_code", ["invalid_grant", "invalid_client"])
 def test_invalid_refresh_clears_tokens_only_for_matching_revision(
     monkeypatch, error_code
@@ -502,6 +786,7 @@ def test_invalid_refresh_clears_tokens_only_for_matching_revision(
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
         "oauth_refresh_token": "enc:refresh",
@@ -535,6 +820,7 @@ def test_invalid_refresh_does_not_clear_after_credential_revision_change(monkeyp
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
         "oauth_refresh_token": "enc:refresh",
@@ -567,6 +853,7 @@ def test_refresh_persists_rotated_refresh_token(monkeypatch):
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
         "oauth_refresh_token": "enc:refresh",
@@ -600,6 +887,7 @@ def test_refresh_persistence_failure_is_reported(monkeypatch):
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
         "oauth_refresh_token": "enc:refresh",
@@ -625,6 +913,7 @@ def test_sync_reports_corrupt_google_ciphertext_per_account(monkeypatch):
     account = {
         "id": "google-1",
         "auth_type": "oauth2_google",
+        "oauth_scope": google_oauth.CALDAV_SCOPE,
         "url": _GOOGLE_PRINCIPAL,
         "oauth_client_id": "client",
         "oauth_client_secret": "enc:secret",
@@ -831,6 +1120,409 @@ def test_oauth_sync_imports_calendar_api_feed_without_dav_client(monkeypatch, sy
         calendar = db.query(CalendarCal).one()
         assert calendar.name == "Google Calendar"
         assert calendar.color == "#123456"
+    finally:
+        db.close()
+
+
+def test_oauth_sync_keeps_same_id_invitation_copies_as_distinct_events(
+    monkeypatch, sync_session
+):
+    _install_oauth_caldav(monkeypatch, sync_session)
+    _clear_sync_db(sync_session)
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+
+    def event_item(event_id):
+        return {
+            "id": event_id,
+            "summary": event_id,
+            "start": {"date": "2026-08-01"},
+            "end": {"date": "2026-08-02"},
+            "extendedProperties": {
+                "private": {"odysseus_uid": preserved_uid}
+            },
+        }
+
+    def feed(calendar_id, event_id):
+        calendar_hash = hashlib.sha256(
+            calendar_id.encode("utf-8")
+        ).hexdigest()[:16]
+        encoded_calendar = calendar_id.replace("@", "%40")
+        return caldav_sync._GoogleCalendarFeed(
+            url=(
+                "https://apidata.googleusercontent.com/caldav/v2/"
+                f"{calendar_id}/events"
+            ),
+            name=calendar_id,
+            color="#123456",
+            icals=(
+                caldav_sync._google_event_to_ical(
+                    calendar_id, event_item(event_id)
+                ),
+            ),
+            resources=(
+                caldav_sync._GoogleEventResource(
+                    url=(
+                        "https://www.googleapis.com/calendar/v3/calendars/"
+                        f"{encoded_calendar}/events/{event_id}"
+                    ),
+                    fallback_uid=f"google-{calendar_hash}-{event_id}",
+                    odysseus_uid=preserved_uid,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        caldav_sync,
+        "_google_fetch_calendar_feeds",
+        lambda *args: [
+            feed("person@example.com", "shared-id"),
+            feed("team@example.com", "shared-id"),
+        ],
+    )
+
+    result = caldav_sync._sync_blocking(
+        "alice", _GOOGLE_PRINCIPAL, account_id="account", access_token="token"
+    )
+
+    assert result["events"] == 2, result
+    assert not result["errors"], result
+    copied_hash = hashlib.sha256(b"team@example.com").hexdigest()[:16]
+    db = sync_session()
+    try:
+        assert {
+            row.uid for row in db.query(CalendarEvent).all()
+        } == {
+            preserved_uid,
+            f"google-{copied_hash}-shared-id",
+        }
+    finally:
+        db.close()
+
+
+def test_oauth_sync_migrates_legacy_caldav_href_without_rekeying(
+    monkeypatch, sync_session
+):
+    _install_oauth_caldav(monkeypatch, sync_session)
+    _clear_sync_db(sync_session)
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    local_calendar_id = caldav_sync._stable_cal_id(
+        _GOOGLE_EVENTS, owner="alice", account_id="account"
+    )
+    legacy_href = (
+        "https://apidata.googleusercontent.com/caldav/v2/"
+        "person@example.com/events"
+    )
+    api_href = (
+        "https://www.googleapis.com/calendar/v3/calendars/"
+        "person%40example.com/events/event-1"
+    )
+    db = sync_session()
+    try:
+        db.add(
+            CalendarCal(
+                id=local_calendar_id,
+                owner="alice",
+                name="Google Calendar",
+                source="caldav",
+                account_id="account",
+                caldav_base_url=_GOOGLE_EVENTS,
+            )
+        )
+        db.add(
+            CalendarEvent(
+                uid=preserved_uid,
+                calendar_id=local_calendar_id,
+                summary="Legacy",
+                dtstart=datetime(2026, 8, 1),
+                dtend=datetime(2026, 8, 2),
+                all_day=True,
+                origin="caldav",
+                remote_href=legacy_href,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    item = {
+        "id": "event-1",
+        "summary": "Migrated",
+        "start": {"date": "2026-08-01"},
+        "end": {"date": "2026-08-02"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    monkeypatch.setattr(
+        caldav_sync,
+        "_google_fetch_calendar_feeds",
+        lambda *args: [
+            caldav_sync._GoogleCalendarFeed(
+                url=_GOOGLE_EVENTS,
+                name="Google Calendar",
+                color="#123456",
+                icals=(
+                    caldav_sync._google_event_to_ical(
+                        "person@example.com", item
+                    ),
+                ),
+                resources=(
+                    caldav_sync._GoogleEventResource(
+                        url=api_href,
+                        fallback_uid="google-fallback-event-1",
+                        odysseus_uid=preserved_uid,
+                    ),
+                ),
+            )
+        ],
+    )
+
+    result = caldav_sync._sync_blocking(
+        "alice", _GOOGLE_PRINCIPAL, account_id="account", access_token="token"
+    )
+
+    assert result["events"] == 1
+    assert not result["errors"]
+    db = sync_session()
+    try:
+        rows = db.query(CalendarEvent).all()
+        assert [row.uid for row in rows] == [preserved_uid]
+        assert rows[0].summary == "Migrated"
+        assert rows[0].remote_href == api_href
+    finally:
+        db.close()
+
+
+def test_oauth_sync_google_move_keeps_stable_odysseus_uid(
+    monkeypatch, sync_session
+):
+    _install_oauth_caldav(monkeypatch, sync_session)
+    _clear_sync_db(sync_session)
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    source_url = (
+        "https://apidata.googleusercontent.com/caldav/v2/"
+        "source@example.com/events"
+    )
+    destination_url = (
+        "https://apidata.googleusercontent.com/caldav/v2/"
+        "destination@example.com/events"
+    )
+    source_calendar_id = caldav_sync._stable_cal_id(
+        source_url, owner="alice", account_id="account"
+    )
+    destination_calendar_id = caldav_sync._stable_cal_id(
+        destination_url, owner="alice", account_id="account"
+    )
+    source_href = (
+        "https://www.googleapis.com/calendar/v3/calendars/"
+        "source%40example.com/events/same-google-id"
+    )
+    destination_href = (
+        "https://www.googleapis.com/calendar/v3/calendars/"
+        "destination%40example.com/events/same-google-id"
+    )
+    db = sync_session()
+    try:
+        db.add(
+            CalendarCal(
+                id=source_calendar_id,
+                owner="alice",
+                name="Source",
+                source="caldav",
+                account_id="account",
+                caldav_base_url=source_url,
+            )
+        )
+        db.add(
+            CalendarEvent(
+                uid=preserved_uid,
+                calendar_id=source_calendar_id,
+                summary="Before move",
+                dtstart=datetime(2026, 8, 1),
+                dtend=datetime(2026, 8, 2),
+                all_day=True,
+                origin="caldav",
+                remote_href=source_href,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    moved = {
+        "id": "same-google-id",
+        "summary": "After move",
+        "start": {"date": "2026-08-01"},
+        "end": {"date": "2026-08-02"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    monkeypatch.setattr(
+        caldav_sync,
+        "_google_fetch_calendar_feeds",
+        lambda *args: [
+            caldav_sync._GoogleCalendarFeed(
+                url=destination_url,
+                name="Destination",
+                color="#123456",
+                icals=(
+                    caldav_sync._google_event_to_ical(
+                        "destination@example.com", moved
+                    ),
+                ),
+                resources=(
+                    caldav_sync._GoogleEventResource(
+                        url=destination_href,
+                        fallback_uid="google-fallback",
+                        odysseus_uid=preserved_uid,
+                    ),
+                ),
+            )
+        ],
+    )
+
+    result = caldav_sync._sync_blocking(
+        "alice", _GOOGLE_PRINCIPAL, account_id="account", access_token="token"
+    )
+
+    assert result["events"] == 1
+    assert not result["errors"]
+    db = sync_session()
+    try:
+        row = db.query(CalendarEvent).one()
+        assert row.uid == preserved_uid
+        assert row.calendar_id == destination_calendar_id
+        assert row.remote_href == destination_href
+    finally:
+        db.close()
+
+
+def test_oauth_sync_does_not_duplicate_local_recurring_master_instances(
+    monkeypatch, sync_session
+):
+    _install_oauth_caldav(monkeypatch, sync_session)
+    _clear_sync_db(sync_session)
+    preserved_uid = "5b1d4e9c-9254-4edc-a9a2-e9136c67f098"
+    calendar_id = "person@example.com"
+    local_calendar_id = caldav_sync._stable_cal_id(
+        _GOOGLE_EVENTS, owner="alice", account_id="account"
+    )
+    db = sync_session()
+    try:
+        calendar = CalendarCal(
+            id=local_calendar_id,
+            owner="alice",
+            name="Google Calendar",
+            source="caldav",
+            account_id="account",
+            caldav_base_url=_GOOGLE_EVENTS,
+        )
+        master = CalendarEvent(
+            uid=preserved_uid,
+            calendar_id=local_calendar_id,
+            summary="Local series",
+            dtstart=datetime(2026, 8, 1, 9, 0),
+            dtend=datetime(2026, 8, 1, 10, 0),
+            rrule="FREQ=DAILY",
+            origin=None,
+            remote_href=(
+                "https://www.googleapis.com/calendar/v3/calendars/"
+                "person%40example.com/events/master"
+            ),
+        )
+        db.add(calendar)
+        db.add(master)
+        db.commit()
+    finally:
+        db.close()
+
+    google_master = {
+        "id": "master",
+        "summary": "Google series",
+        "start": {
+            "dateTime": "2026-08-01T11:00:00+02:00",
+            "timeZone": "Europe/Zurich",
+        },
+        "end": {
+            "dateTime": "2026-08-01T12:00:00+02:00",
+            "timeZone": "Europe/Zurich",
+        },
+        "recurrence": [
+            "RRULE:FREQ=DAILY",
+            "EXDATE:20260803T070000Z",
+        ],
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    instance = {
+        "id": "master_20260802T070000Z",
+        "recurringEventId": "master",
+        "summary": "Local series",
+        "start": {"dateTime": "2026-08-02T09:00:00+02:00"},
+        "end": {"dateTime": "2026-08-02T10:00:00+02:00"},
+        "extendedProperties": {
+            "private": {"odysseus_uid": preserved_uid}
+        },
+    }
+    instance_hash = hashlib.sha256(calendar_id.encode()).hexdigest()[:16]
+    monkeypatch.setattr(
+        caldav_sync,
+        "_google_fetch_calendar_feeds",
+        lambda *args: [
+            caldav_sync._GoogleCalendarFeed(
+                url=_GOOGLE_EVENTS,
+                name="Google Calendar",
+                color="#123456",
+                icals=(
+                    caldav_sync._google_event_to_ical(
+                        calendar_id, google_master
+                    ),
+                    caldav_sync._google_event_to_ical(calendar_id, instance),
+                ),
+                resources=(
+                    caldav_sync._GoogleEventResource(
+                        url=(
+                            "https://www.googleapis.com/calendar/v3/calendars/"
+                            "person%40example.com/events/master"
+                        ),
+                        fallback_uid=f"google-{instance_hash}-master",
+                        odysseus_uid=preserved_uid,
+                        timezone="Europe/Zurich",
+                    ),
+                    caldav_sync._GoogleEventResource(
+                        url=(
+                            "https://www.googleapis.com/calendar/v3/calendars/"
+                            "person%40example.com/events/"
+                            "master_20260802T070000Z"
+                        ),
+                        fallback_uid=(
+                            f"google-{instance_hash}-"
+                            "master_20260802T070000Z"
+                        ),
+                        odysseus_uid=preserved_uid,
+                        recurring_instance=True,
+                    ),
+                ),
+            )
+        ],
+    )
+
+    result = caldav_sync._sync_blocking(
+        "alice", _GOOGLE_PRINCIPAL, account_id="account", access_token="token"
+    )
+
+    assert not result["errors"], result
+    db = sync_session()
+    try:
+        rows = db.query(CalendarEvent).all()
+        assert [row.uid for row in rows] == [preserved_uid]
+        assert rows[0].summary == "Google series"
+        assert rows[0].dtstart == datetime(2026, 8, 1, 9, 0)
+        assert rows[0].timezone_name == "Europe/Zurich"
+        assert rows[0].rrule == "FREQ=DAILY"
+        assert rows[0].recurrence_exdates == '["2026-08-03T07:00"]'
     finally:
         db.close()
 

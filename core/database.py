@@ -1765,6 +1765,9 @@ class CalendarEvent(TimestampMixin, Base):
     # that preserve the source TZID). False = legacy naive-local. Drives the
     # `Z`-suffix on serialization so the frontend interprets correctly.
     is_utc      = Column(Boolean, default=False, nullable=False)
+    timezone_name = Column(
+        "timezone", String, default=""
+    )  # IANA zone for round-trip writes
     rrule       = Column(String, default="")
     recurrence_exdates = Column(Text, default="")  # JSON list of skipped occurrence starts
     color       = Column(String, nullable=True)  # per-event color override
@@ -1963,6 +1966,7 @@ def init_db():
     _migrate_seed_email_account()
     _migrate_add_calendar_metadata()
     _migrate_add_calendar_is_utc()
+    _migrate_add_calendar_timezone()
     _migrate_add_calendar_origin()
     _migrate_add_calendar_account_id()
     _migrate_add_caldav_sync_columns()
@@ -2389,6 +2393,32 @@ def _migrate_add_calendar_recurrence_exdates():
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_add_calendar_timezone():
+    """Add the source/user IANA zone needed for safe Calendar API writes."""
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(calendar_events)"
+            ).fetchall()
+        ]
+        if columns and "timezone" not in columns:
+            conn.execute(
+                "ALTER TABLE calendar_events ADD COLUMN timezone TEXT DEFAULT ''"
+            )
+        conn.commit()
+    except Exception as exc:
+        logger.warning("calendar_events timezone migration failed: %s", exc)
+    finally:
+        if conn is not None:
+            conn.close()
 
 def get_db():
     """

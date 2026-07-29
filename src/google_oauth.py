@@ -7,15 +7,55 @@ code for tokens, and refreshing access tokens when they expire.
 import os
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-# This integration only pulls calendar data; request the least-privileged
-# read-only scope for new consent grants.
-CALDAV_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
+# Odysseus lists calendars and performs two-way event sync, but does not manage
+# calendar sharing, ACLs, or calendar settings. Request the two narrow scopes
+# required for those operations. The broader legacy scope remains accepted by
+# ``has_calendar_write_scope`` so existing grants keep working.
+CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+CALENDAR_LIST_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+)
+CALENDAR_LIST_WRITE_SCOPE = (
+    "https://www.googleapis.com/auth/calendar.calendarlist"
+)
+CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+CALENDAR_FULL_SCOPE = "https://www.googleapis.com/auth/calendar"
+CALDAV_SCOPE = f"{CALENDAR_EVENTS_SCOPE} {CALENDAR_LIST_SCOPE}"
+
+
+def google_calendar_events_url(calendar_id: str, event_id: str = "") -> str:
+    """Build the host-pinned Calendar API events URL used by pull and push."""
+    collection = (
+        f"{GOOGLE_CALENDAR_API_BASE}/calendars/"
+        f"{quote(str(calendar_id), safe='')}/events"
+    )
+    if not event_id:
+        return collection
+    return f"{collection}/{quote(str(event_id), safe='')}"
+
+
+def has_calendar_write_scope(scope: object) -> bool:
+    """Return whether a grant can list calendars and edit their events."""
+    if not isinstance(scope, str):
+        return False
+    granted = set(scope.split())
+    list_capable_scopes = {
+        CALENDAR_LIST_SCOPE,
+        CALENDAR_LIST_WRITE_SCOPE,
+        CALENDAR_READ_SCOPE,
+    }
+    return CALENDAR_FULL_SCOPE in granted or (
+        CALENDAR_EVENTS_SCOPE in granted
+        and bool(granted.intersection(list_capable_scopes))
+    )
 
 
 class GoogleOAuthCredentialError(RuntimeError):
@@ -96,7 +136,9 @@ async def exchange_code(
     client_id: str, client_secret: str, code: str, redirect_uri: str
 ) -> dict:
     """Exchange an authorization code for access + refresh tokens.
-    Returns {access_token, refresh_token, expires_at}."""
+    Returns {access_token, refresh_token, expires_at, scope}.  ``scope`` is
+    Google's authoritative grant, which may be narrower than what was requested.
+    """
     async with httpx.AsyncClient(timeout=10.0, trust_env=False) as cx:
         r = await cx.post(GOOGLE_TOKEN_URL, data={
             "client_id": client_id,
@@ -111,6 +153,7 @@ async def exchange_code(
         "access_token": data["access_token"],
         "refresh_token": data.get("refresh_token", ""),
         "expires_at": int(time.time()) + data.get("expires_in", 3600) - 60,
+        "scope": str(data.get("scope") or ""),
     }
 
 
@@ -143,6 +186,17 @@ async def refresh_access_token(
         "access_token": data["access_token"],
         "expires_at": int(time.time()) + data.get("expires_in", 3600) - 60,
     }
+    if data.get("scope") is not None:
+        result["scope"] = str(data.get("scope") or "")
     if data.get("refresh_token"):
         result["refresh_token"] = data["refresh_token"]
     return result
+
+
+async def revoke_token(token: str) -> None:
+    """Revoke a token that Odysseus deliberately declines to retain."""
+    if not isinstance(token, str) or not token:
+        return
+    async with httpx.AsyncClient(timeout=10.0, trust_env=False) as cx:
+        response = await cx.post(GOOGLE_REVOKE_URL, data={"token": token})
+        response.raise_for_status()

@@ -36,6 +36,7 @@ def route_context(monkeypatch):
                     "label": "Google",
                     "url": "https://apidata.googleusercontent.com/caldav/v2/me@example.com/user",
                     "auth_type": "oauth2_google",
+                    "oauth_scope": google_oauth.CALDAV_SCOPE,
                     "oauth_client_id": "client-public",
                     "oauth_client_secret": "enc:client-secret",
                     "oauth_access_token": "enc:access-secret",
@@ -146,6 +147,62 @@ def test_callback_rejects_corrupt_stored_refresh_token_when_google_omits_one(
     assert state["prefs"]["caldav_accounts"][0]["oauth_access_token"] == "enc:access-secret"
 
 
+def test_callback_records_current_read_write_scope(route_context, monkeypatch):
+    state, router = route_context
+    callback = _endpoint(router, "/oauth/google/callback", "GET")
+    oauth_state = google_oauth.generate_state("alice", "google-1")
+
+    async def successful_exchange(*args):
+        return {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_at": 1234,
+            "scope": google_oauth.CALDAV_SCOPE,
+        }
+
+    monkeypatch.setattr(google_oauth, "exchange_code", successful_exchange)
+    response = asyncio.run(callback(_Request(), code="code", state=oauth_state))
+
+    assert response.status_code == 200
+    account = state["prefs"]["caldav_accounts"][0]
+    assert account["oauth_scope"] == google_oauth.CALDAV_SCOPE
+    assert account["oauth_access_token"] == "enc:new-access"
+    assert account["oauth_refresh_token"] == "enc:new-refresh"
+
+
+def test_callback_rejects_and_records_insufficient_granted_scope(
+    route_context, monkeypatch
+):
+    state, router = route_context
+    callback = _endpoint(router, "/oauth/google/callback", "GET")
+    oauth_state = google_oauth.generate_state("alice", "google-1")
+
+    async def readonly_exchange(*args):
+        return {
+            "access_token": "readonly-access",
+            "refresh_token": "readonly-refresh",
+            "expires_at": 1234,
+            "scope": "https://www.googleapis.com/auth/calendar.readonly",
+        }
+
+    revoked = []
+
+    async def record_revoke(token):
+        revoked.append(token)
+
+    monkeypatch.setattr(google_oauth, "exchange_code", readonly_exchange)
+    monkeypatch.setattr(google_oauth, "revoke_token", record_revoke)
+    response = asyncio.run(callback(_Request(), code="code", state=oauth_state))
+
+    assert response.status_code == 403
+    assert revoked == ["readonly-refresh"]
+    account = state["prefs"]["caldav_accounts"][0]
+    assert account["oauth_scope"].endswith("/calendar.readonly")
+    assert account["oauth_access_token"] == ""
+    assert account["oauth_refresh_token"] == ""
+    assert account["oauth_expires_at"] == 0
+
+
 def test_callback_does_not_write_tokens_after_concurrent_auth_switch(
     route_context, monkeypatch
 ):
@@ -230,6 +287,33 @@ def test_google_account_list_exposes_client_id_but_no_secret_or_tokens(route_con
     assert "oauth_client_secret" not in account
     assert "oauth_access_token" not in account
     assert "oauth_refresh_token" not in account
+
+
+def test_google_account_list_accepts_existing_full_calendar_grant(route_context):
+    state, router = route_context
+    state["prefs"]["caldav_accounts"][0][
+        "oauth_scope"
+    ] = google_oauth.CALENDAR_FULL_SCOPE
+    list_accounts = _endpoint(router, "/config/accounts", "GET")
+
+    result = asyncio.run(list_accounts(_Request()))
+
+    account = result["accounts"][0]
+    assert account["has_access_token"] is True
+    assert account["is_connected"] is True
+
+
+def test_google_account_list_marks_legacy_pull_grant_for_reconnect(route_context):
+    state, router = route_context
+    state["prefs"]["caldav_accounts"][0].pop("oauth_scope")
+    list_accounts = _endpoint(router, "/config/accounts", "GET")
+
+    result = asyncio.run(list_accounts(_Request()))
+
+    account = result["accounts"][0]
+    assert account["has_access_token"] is True
+    assert account["is_connected"] is True
+    assert account["needs_reconnect"] is True
 
 
 def test_google_account_list_tolerates_malformed_encrypted_values(route_context, monkeypatch):

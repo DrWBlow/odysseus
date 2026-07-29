@@ -33,7 +33,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote, unquote, urlparse, urlunparse
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from src.google_oauth import (
+    GOOGLE_CALENDAR_API_BASE,
+    google_calendar_events_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +54,27 @@ _BLOCKED_HOSTS = {
     "metadata.google.internal",
 }
 _GOOGLE_CALDAV_HOST = "apidata.googleusercontent.com"
-_GOOGLE_CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
 _GOOGLE_PATH_SAFE = "@!$&'()*+,;=._~-"
 # A host-pinned response is still untrusted input.  Keep XML parsing bounded
 # so a broken or compromised response cannot consume unbounded memory.
 _GOOGLE_REPORT_MAX_BYTES = 16 * 1024 * 1024
 _GOOGLE_API_MAX_CALENDARS = 250
 _GOOGLE_API_MAX_EVENTS = 10_000
+_GOOGLE_API_MAX_ROWS = 50_000
+_GOOGLE_API_MAX_MASTER_LOOKUPS = 1_000
+
+
+@dataclass(frozen=True)
+class _GoogleEventResource:
+    """Minimal resource metadata consumed by the common CalDAV importer."""
+
+    url: str
+    etag: str = ""
+    fallback_uid: str = ""
+    odysseus_uid: str = ""
+    recurring_instance: bool = False
+    recurrence_exception: bool = False
+    timezone: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,6 +85,42 @@ class _GoogleCalendarFeed:
     name: str
     color: str
     icals: tuple[str, ...]
+    resources: tuple[_GoogleEventResource, ...] = ()
+
+
+def _google_api_href_conflicts(existing_href: str, incoming_href: str) -> bool:
+    """Compare REST hrefs without mistaking legacy CalDAV URLs for claims."""
+    return bool(
+        existing_href
+        and existing_href.startswith(
+            f"{GOOGLE_CALENDAR_API_BASE}/calendars/"
+        )
+        and existing_href != incoming_href
+    )
+
+
+def _google_api_event_id_from_href(href: str) -> str:
+    """Return the decoded event id from a host-pinned Calendar API href."""
+    parsed = urlparse(str(href or ""))
+    segments = parsed.path.rstrip("/").split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != urlparse(GOOGLE_CALENDAR_API_BASE).hostname
+        or parsed.port is not None
+        or parsed.query
+        or parsed.fragment
+        or len(segments) != 7
+        or segments[:4] != ["", "calendar", "v3", "calendars"]
+        or segments[5] != "events"
+    ):
+        return ""
+    return unquote(segments[6])
+
+
+def _google_hrefs_are_same_event(existing_href: str, incoming_href: str) -> bool:
+    existing_id = _google_api_event_id_from_href(existing_href)
+    incoming_id = _google_api_event_id_from_href(incoming_href)
+    return bool(existing_id and existing_id == incoming_id)
 
 
 def _private_caldav_allowed() -> bool:
@@ -183,7 +238,9 @@ def _to_utc_naive(dt):
     return datetime(dt.year, dt.month, dt.day), True
 
 
-def _find_existing_event(db, pending, uid_val, calendar_id):
+def _find_existing_event(
+    db, pending, uid_val, calendar_id, move_from_calendar_id=""
+):
     """Find the event to update for THIS calendar.
 
     CalendarEvent.uid is the global primary key, so an unscoped lookup by uid
@@ -196,10 +253,61 @@ def _find_existing_event(db, pending, uid_val, calendar_id):
     instead of hijacking the row. (import_ics was already fixed this way.)
     """
     from core.database import CalendarEvent
-    return pending.get(uid_val) or db.query(CalendarEvent).filter(
+    if pending.get(uid_val):
+        return pending[uid_val]
+    calendar_ids = [calendar_id]
+    if move_from_calendar_id and move_from_calendar_id != calendar_id:
+        calendar_ids.append(move_from_calendar_id)
+    return db.query(CalendarEvent).filter(
         CalendarEvent.uid == uid_val,
-        CalendarEvent.calendar_id == calendar_id,
+        CalendarEvent.calendar_id.in_(calendar_ids),
     ).first()
+
+
+def _ical_recurrence_exdate_keys(component, all_day: bool) -> list[str]:
+    raw = component.get("exdate")
+    properties = raw if isinstance(raw, list) else ([raw] if raw else [])
+    keys: set[str] = set()
+    for prop in properties:
+        for item in getattr(prop, "dts", []):
+            value = getattr(item, "dt", None)
+            if value is None:
+                continue
+            normalized, _ = _to_utc_naive(value)
+            keys.add(
+                normalized.strftime(
+                    "%Y-%m-%d" if all_day else "%Y-%m-%dT%H:%M"
+                )
+            )
+    return sorted(keys)
+
+
+def _merge_google_recurrence_exdates(
+    stored: str,
+    current: list[str],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[str]:
+    """Keep exclusions outside the bounded API window; refresh those inside."""
+    try:
+        previous = json.loads(stored or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        previous = []
+    merged = {str(value) for value in current if value}
+    for raw in previous if isinstance(previous, list) else []:
+        value = str(raw or "")
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        except (TypeError, ValueError):
+            merged.add(value)
+            continue
+        if parsed < window_start or parsed > window_end:
+            merged.add(value)
+    return sorted(merged)
 
 
 def _google_caldav_events_url(url: str) -> str | None:
@@ -455,8 +563,178 @@ def _google_event_datetime(value: dict):
         raise ValueError("Google event has no date or dateTime")
     parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if parsed.tzinfo is None and value.get("timeZone"):
-        parsed = parsed.replace(tzinfo=ZoneInfo(str(value["timeZone"])))
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(str(value["timeZone"])))
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Google event has an unknown time zone") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
     return parsed
+
+
+def _google_event_time_key(value: dict) -> tuple[str, object]:
+    """Comparable key for Google start/originalStartTime values."""
+    if value.get("date"):
+        return "date", date.fromisoformat(str(value["date"]))
+    parsed = _google_event_datetime(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+    return "dateTime", parsed
+
+
+def _google_instance_is_exception(instance: dict, master: dict) -> bool:
+    if instance.get("status") == "cancelled":
+        return True
+    original = instance.get("originalStartTime") or {}
+    start = instance.get("start") or {}
+    if original and start:
+        try:
+            if _google_event_time_key(original) != _google_event_time_key(start):
+                return True
+        except (TypeError, ValueError):
+            return True
+    for field in ("summary", "description", "location"):
+        if field in instance and str(instance.get(field) or "") != str(
+            master.get(field) or ""
+        ):
+            return True
+    try:
+        master_start = _google_event_datetime(master.get("start") or {})
+        master_end = _google_event_datetime(master.get("end") or {})
+        instance_start = _google_event_datetime(instance.get("start") or {})
+        instance_end = _google_event_datetime(instance.get("end") or {})
+        if (master_end - master_start) != (instance_end - instance_start):
+            return True
+    except (TypeError, ValueError):
+        # Do not silently fold malformed instance timing into the master's
+        # duration. The common importer will preserve or safely skip it.
+        return True
+    return False
+
+
+def _google_exdate_line(value: dict) -> str:
+    if value.get("date"):
+        parsed_date = date.fromisoformat(str(value["date"]))
+        return f"EXDATE;VALUE=DATE:{parsed_date.strftime('%Y%m%d')}"
+    parsed = _google_event_datetime(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc)
+        return f"EXDATE:{parsed.strftime('%Y%m%dT%H%M%SZ')}"
+    return f"EXDATE:{parsed.strftime('%Y%m%dT%H%M%S')}"
+
+
+def _google_reconcile_odysseus_series(
+    client,
+    headers: dict,
+    calendar_id: str,
+    event_items: list[dict],
+) -> list[dict]:
+    """Replace expanded Odysseus instances with their master plus exceptions."""
+    grouped: dict[str, list[dict]] = {}
+    untouched: list[dict] = []
+    for item in event_items:
+        master_id = str(item.get("recurringEventId") or "")
+        if master_id and _google_odysseus_uid(item):
+            grouped.setdefault(master_id, []).append(item)
+        else:
+            untouched.append(item)
+
+    if len(grouped) > _GOOGLE_API_MAX_MASTER_LOOKUPS:
+        overflow_ids = list(grouped)[_GOOGLE_API_MAX_MASTER_LOOKUPS:]
+        for master_id in overflow_ids:
+            untouched.extend(grouped.pop(master_id))
+        logger.warning(
+            "Google recurring master reconciliation capped at %s lookups",
+            _GOOGLE_API_MAX_MASTER_LOOKUPS,
+        )
+
+    for master_id, instances in grouped.items():
+        try:
+            response = client.get(
+                google_calendar_events_url(calendar_id, master_id),
+                headers=headers,
+            )
+            if response.status_code in {404, 410}:
+                untouched.extend(instances)
+                continue
+            response.raise_for_status()
+            master = dict(response.json())
+        except Exception as exc:
+            # A single unavailable master must not abort the entire account.
+            logger.warning(
+                "Could not reconcile Google recurring master %s: %s",
+                master_id,
+                type(exc).__name__,
+            )
+            untouched.extend(instances)
+            continue
+        recurrence = [
+            str(line) for line in master.get("recurrence") or []
+            if isinstance(line, str)
+        ]
+        exceptions: list[dict] = []
+        for instance in instances:
+            if not _google_instance_is_exception(instance, master):
+                continue
+            original = instance.get("originalStartTime") or {}
+            if original:
+                try:
+                    exdate = _google_exdate_line(original)
+                except (TypeError, ValueError):
+                    exdate = ""
+                if exdate and exdate not in recurrence:
+                    recurrence.append(exdate)
+            if instance.get("status") != "cancelled" and instance.get("start"):
+                exception = dict(instance)
+                exception["_odysseus_recurrence_exception"] = True
+                exceptions.append(exception)
+        master["recurrence"] = recurrence
+        untouched.append(master)
+        untouched.extend(exceptions)
+    return untouched
+
+
+def _google_add_exdate_to_ical(event, recurrence: str) -> None:
+    """Parse one Google EXDATE recurrence line onto an iCalendar event."""
+    header, raw_values = recurrence.split(":", 1)
+    params = {
+        key.upper(): value
+        for key, _, value in (
+            token.partition("=") for token in header.split(";")[1:]
+        )
+        if key and value
+    }
+    for raw in raw_values.split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        if params.get("VALUE", "").upper() == "DATE":
+            event.add("exdate", datetime.strptime(value, "%Y%m%d").date())
+            continue
+        if value.endswith("Z"):
+            parsed = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        else:
+            parsed = datetime.strptime(value, "%Y%m%dT%H%M%S")
+            if params.get("TZID"):
+                parsed = parsed.replace(tzinfo=ZoneInfo(params["TZID"]))
+        event.add("exdate", parsed)
+
+
+def _google_odysseus_uid(item: dict) -> str:
+    """Return a valid private Odysseus UID from a Google event, if present."""
+    extended_properties = item.get("extendedProperties")
+    if not isinstance(extended_properties, dict):
+        extended_properties = {}
+    private_properties = extended_properties.get("private")
+    if not isinstance(private_properties, dict):
+        private_properties = {}
+    odysseus_uid = private_properties.get("odysseus_uid")
+    try:
+        return str(uuid.UUID(str(odysseus_uid)))
+    except (ValueError, TypeError):
+        return ""
 
 
 def _google_event_to_ical(calendar_id: str, item: dict) -> str:
@@ -468,8 +746,14 @@ def _google_event_to_ical(calendar_id: str, item: dict) -> str:
         raise ValueError("Google event has no id")
 
     calendar_hash = hashlib.sha256(calendar_id.encode("utf-8")).hexdigest()[:16]
+    # Expanded recurring instances inherit the master's private properties.
+    # They must keep their own Google-derived UID; otherwise every occurrence
+    # claims the local recurring master's primary key.
+    preserved_uid = (
+        "" if item.get("recurringEventId") else _google_odysseus_uid(item)
+    )
     event = iEvent()
-    event.add("uid", f"google-{calendar_hash}-{event_id}")
+    event.add("uid", preserved_uid or f"google-{calendar_hash}-{event_id}")
     event.add("dtstart", _google_event_datetime(item.get("start") or {}))
     if item.get("end"):
         event.add("dtend", _google_event_datetime(item["end"]))
@@ -477,10 +761,18 @@ def _google_event_to_ical(calendar_id: str, item: dict) -> str:
         value = item.get(field)
         if value:
             event.add(field, str(value))
+    rrule_seen = False
     for recurrence in item.get("recurrence") or []:
-        if isinstance(recurrence, str) and recurrence.upper().startswith("RRULE:"):
+        if not isinstance(recurrence, str):
+            continue
+        if recurrence.upper().startswith("RRULE:") and not rrule_seen:
             event.add("rrule", vRecur.from_ical(recurrence.split(":", 1)[1]))
-            break
+            rrule_seen = True
+        elif recurrence.upper().startswith("EXDATE"):
+            try:
+                _google_add_exdate_to_ical(event, recurrence)
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                logger.warning("Skipping malformed Google EXDATE %r", recurrence)
 
     calendar = iCal()
     calendar.add("prodid", "-//Odysseus//Google Calendar read-only sync//EN")
@@ -492,12 +784,11 @@ def _google_event_to_ical(calendar_id: str, item: dict) -> str:
 def _google_fetch_calendar_feeds(
     access_token: str, start: datetime, end: datetime
 ) -> list[_GoogleCalendarFeed]:
-    """Fetch subscribed calendars and events through Google's read-only API.
+    """Fetch subscribed calendars and events through Google Calendar API.
 
-    Google currently accepts the ``calendar.readonly`` token for Calendar API
-    requests but can reject CalDAV ``calendar-query`` REPORT requests with 403.
-    Use the REST API for the Google-OAuth pull path so the integration remains
-    least-privileged. Generic username/password accounts still use CalDAV.
+    Google can reject CalDAV ``calendar-query`` REPORT requests with 403 even
+    when the Calendar API grant is valid. Use the REST API for the Google OAuth
+    pull path; generic username/password accounts still use CalDAV.
     """
     import httpx
 
@@ -512,7 +803,7 @@ def _google_fetch_calendar_feeds(
             if page_token:
                 params["pageToken"] = page_token
             response = cx.get(
-                f"{_GOOGLE_CALENDAR_API_BASE}/users/me/calendarList",
+                f"{GOOGLE_CALENDAR_API_BASE}/users/me/calendarList",
                 headers=headers,
                 params=params,
             )
@@ -530,6 +821,7 @@ def _google_fetch_calendar_feeds(
 
         feeds: list[_GoogleCalendarFeed] = []
         total_events = 0
+        total_rows = 0
         for remote in calendars:
             calendar_id = str(remote.get("id") or "")
             if not calendar_id:
@@ -544,23 +836,34 @@ def _google_fetch_calendar_feeds(
                     # Expand recurrences server-side so moved/cancelled instances
                     # are represented exactly within our bounded sync window.
                     "singleEvents": "true",
-                    "showDeleted": "false",
+                    "showDeleted": "true",
                     "maxResults": 2500,
                 }
                 if page_token:
                     params["pageToken"] = page_token
                 response = cx.get(
-                    f"{_GOOGLE_CALENDAR_API_BASE}/calendars/"
-                    f"{quote(calendar_id, safe='')}/events",
+                    google_calendar_events_url(calendar_id),
                     headers=headers,
                     params=params,
                 )
                 response.raise_for_status()
                 payload = response.json()
-                event_items.extend(payload.get("items") or [])
-                total_events += len(payload.get("items") or [])
+                page_items = payload.get("items") or []
+                event_items.extend(page_items)
+                total_rows += len(page_items)
+                total_events += sum(
+                    item.get("status") != "cancelled"
+                    for item in page_items
+                    if isinstance(item, dict)
+                )
+                if total_rows > _GOOGLE_API_MAX_ROWS:
+                    raise RuntimeError(
+                        "Google event rows exceeded the safety limit"
+                    )
                 if total_events > _GOOGLE_API_MAX_EVENTS:
-                    raise RuntimeError("Google events exceeded the safety limit")
+                    raise RuntimeError(
+                        "Google active events exceeded the safety limit"
+                    )
                 page_token = payload.get("nextPageToken")
                 if not page_token:
                     break
@@ -568,18 +871,44 @@ def _google_fetch_calendar_feeds(
                     raise RuntimeError("Google events pagination repeated")
                 seen_page_tokens.add(page_token)
 
+            event_items = _google_reconcile_odysseus_series(
+                cx, headers, calendar_id, event_items
+            )
             icals = []
+            resources = []
             for item in event_items:
                 if item.get("status") == "cancelled" or not item.get("start"):
                     continue
                 try:
-                    icals.append(_google_event_to_ical(calendar_id, item))
-                except (TypeError, ValueError) as exc:
+                    event_id = str(item.get("id") or "")
+                    ical_text = _google_event_to_ical(calendar_id, item)
+                    resource = _GoogleEventResource(
+                        url=(
+                            google_calendar_events_url(calendar_id, event_id)
+                        ),
+                        etag=str(item.get("etag") or ""),
+                        fallback_uid=(
+                            f"google-{hashlib.sha256(calendar_id.encode('utf-8')).hexdigest()[:16]}"
+                            f"-{event_id}"
+                        ),
+                        odysseus_uid=_google_odysseus_uid(item),
+                        recurring_instance=bool(item.get("recurringEventId")),
+                        recurrence_exception=bool(
+                            item.get("_odysseus_recurrence_exception")
+                        ),
+                        timezone=str(
+                            (item.get("start") or {}).get("timeZone") or ""
+                        ),
+                    )
+                except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
                     logger.warning(
                         "Skipping malformed Google event in calendar %s: %s",
                         calendar_id,
                         exc,
                     )
+                    continue
+                icals.append(ical_text)
+                resources.append(resource)
 
             encoded_id = quote(calendar_id, safe=_GOOGLE_PATH_SAFE)
             feeds.append(
@@ -591,6 +920,7 @@ def _google_fetch_calendar_feeds(
                     name=str(remote.get("summaryOverride") or remote.get("summary") or "Google Calendar"),
                     color=str(remote.get("backgroundColor") or "#5b8abf"),
                     icals=tuple(icals),
+                    resources=tuple(resources),
                 )
             )
     return feeds
@@ -698,8 +1028,34 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                     result["errors"].append(f"No calendars and URL fallback failed: {e}")
                     return result
 
+        google_current_hrefs = {
+            resource.url
+            for calendar in calendars
+            for resource in getattr(calendar, "resources", ())
+            if getattr(resource, "url", "")
+        }
+
         db = SessionLocal()        # if this raises, outer finally still calls client.close()
         try:
+            google_claims: dict[str, tuple[str, str]] = {}
+            if access_token:
+                for claimed_uid, claimed_calendar, claimed_href in (
+                    db.query(
+                        CalendarEvent.uid,
+                        CalendarEvent.calendar_id,
+                        CalendarEvent.remote_href,
+                    )
+                    .join(CalendarCal)
+                    .filter(
+                        CalendarCal.owner == owner,
+                        CalendarCal.source == "caldav",
+                    )
+                    .all()
+                ):
+                    google_claims[str(claimed_uid)] = (
+                        str(claimed_calendar),
+                        str(claimed_href or ""),
+                    )
             for remote_cal in calendars:
                 try:
                     remote_url = str(remote_cal.url)
@@ -756,7 +1112,13 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                     prune_blocked = False
                     if access_token:
                         ical_records = [
-                            (ical_text, None) for ical_text in remote_cal.icals
+                            (
+                                ical_text,
+                                remote_cal.resources[index]
+                                if index < len(remote_cal.resources)
+                                else None,
+                            )
+                            for index, ical_text in enumerate(remote_cal.icals)
                         ]
                     else:
                         try:
@@ -798,7 +1160,97 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                         for comp in ical.walk():
                             if comp.name != "VEVENT":
                                 continue
+                            recurring_odysseus_uid = (
+                                str(getattr(resource, "odysseus_uid", "") or "")
+                                if resource is not None
+                                and getattr(resource, "recurring_instance", False)
+                                and not getattr(
+                                    resource, "recurrence_exception", False
+                                )
+                                else ""
+                            )
+                            if recurring_odysseus_uid:
+                                local_master = db.query(CalendarEvent).filter(
+                                    CalendarEvent.uid == recurring_odysseus_uid,
+                                    CalendarEvent.calendar_id == local_cal.id,
+                                ).first()
+                                if local_master is not None:
+                                    # The local RRULE expands this series in the
+                                    # interface. Importing Google's expanded
+                                    # instances as separate events would show
+                                    # every occurrence twice.
+                                    seen_uids.add(recurring_odysseus_uid)
+                                    continue
                             uid_val = str(comp.get("uid", "")) or str(uuid.uuid4())
+                            move_from_calendar_id = ""
+                            resource_href = (
+                                str(getattr(resource, "url", "") or "")
+                                if resource is not None
+                                else remote_url
+                            ) or None
+                            resource_etag = (
+                                _event_etag(resource) if resource is not None else ""
+                            ) or None
+                            # Google preserves private extended properties when
+                            # users copy events. A copied odysseus_uid must not
+                            # collapse two distinct remote resources onto the
+                            # globally unique local primary key.
+                            if access_token and resource_href:
+                                preserved_uid = str(
+                                    getattr(resource, "odysseus_uid", "") or ""
+                                )
+                                claim = google_claims.get(uid_val)
+                                same_remote_event = bool(
+                                    claim
+                                    and _google_hrefs_are_same_event(
+                                        claim[1], resource_href
+                                    )
+                                    and claim[1] not in google_current_hrefs
+                                )
+                                if (
+                                    preserved_uid
+                                    and uid_val == preserved_uid
+                                    and claim is not None
+                                    and not same_remote_event
+                                    and (
+                                        claim[0] != local_cal.id
+                                        or _google_api_href_conflicts(
+                                            claim[1], resource_href
+                                        )
+                                    )
+                                ):
+                                    fallback_uid = str(
+                                        getattr(resource, "fallback_uid", "") or ""
+                                    )
+                                    if fallback_uid:
+                                        uid_val = fallback_uid
+                                claim = google_claims.get(uid_val)
+                                if claim is not None and (
+                                    claim[0] != local_cal.id
+                                    or _google_api_href_conflicts(
+                                        claim[1], resource_href
+                                    )
+                                ):
+                                    if (
+                                        _google_hrefs_are_same_event(
+                                        claim[1], resource_href
+                                        )
+                                        and claim[1] not in google_current_hrefs
+                                    ):
+                                        # events.move keeps Google's event id.
+                                        # Relocate the owner-scoped row without
+                                        # losing its stable Odysseus UUID.
+                                        move_from_calendar_id = claim[0]
+                                    else:
+                                        # Copies/shared appearances have
+                                        # distinct Google ids and need a
+                                        # namespaced local key.
+                                        namespace = hashlib.sha256(
+                                            f"{local_cal.id}\n{resource_href}".encode(
+                                                "utf-8"
+                                            )
+                                        ).hexdigest()[:24]
+                                        uid_val = f"google-account-{namespace}"
                             seen_uids.add(uid_val)
 
                             dtstart_p = comp.get("dtstart")
@@ -826,6 +1278,19 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                                 and isinstance(dtstart_p.dt, datetime)
                                 and dtstart_p.dt.tzinfo is not None
                             )
+                            row_timezone = (
+                                str(getattr(resource, "timezone", "") or "")
+                                if resource is not None
+                                else ""
+                            ) or str(
+                                dtstart_p.params.get("TZID")
+                                or getattr(
+                                    getattr(dtstart_p.dt, "tzinfo", None),
+                                    "key",
+                                    "",
+                                )
+                                or ""
+                            )
 
                             summary = str(comp.get("summary", ""))
                             description = str(comp.get("description", ""))
@@ -835,19 +1300,23 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                                 if comp.get("rrule")
                                 else ""
                             )
+                            recurrence_exdates = _ical_recurrence_exdate_keys(
+                                comp, all_day
+                            )
 
-                            resource_href = (
-                                str(getattr(resource, "url", "") or "")
-                                if resource is not None
-                                else remote_url
-                            ) or None
-                            resource_etag = (
-                                _event_etag(resource) if resource is not None else ""
-                            ) or None
-
-                            existing = _find_existing_event(db, pending, uid_val, local_cal.id)
+                            existing = _find_existing_event(
+                                db,
+                                pending,
+                                uid_val,
+                                local_cal.id,
+                                move_from_calendar_id,
+                            )
                             if existing:
                                 if existing.caldav_sync_pending in {"create", "update"}:
+                                    google_claims[uid_val] = (
+                                        local_cal.id,
+                                        resource_href or "",
+                                    )
                                     result["events"] += 1
                                     continue
                                 existing.calendar_id = local_cal.id
@@ -858,11 +1327,35 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                                 existing.dtend = end_dt
                                 existing.all_day = all_day
                                 existing.is_utc = row_is_utc
+                                existing.timezone_name = row_timezone
                                 existing.rrule = rrule
+                                if (
+                                    access_token
+                                    and rrule
+                                    and resource is not None
+                                    and not getattr(
+                                        resource, "recurring_instance", False
+                                    )
+                                ):
+                                    recurrence_exdates = (
+                                        _merge_google_recurrence_exdates(
+                                            existing.recurrence_exdates,
+                                            recurrence_exdates,
+                                            start,
+                                            end,
+                                        )
+                                    )
+                                existing.recurrence_exdates = json.dumps(
+                                    recurrence_exdates
+                                )
                                 existing.origin = "caldav"
                                 existing.remote_href = resource_href
                                 existing.remote_etag = resource_etag
                                 existing.caldav_sync_pending = None
+                                google_claims[uid_val] = (
+                                    local_cal.id,
+                                    resource_href or "",
+                                )
                             else:
                                 new_ev = CalendarEvent(
                                     uid=uid_val,
@@ -874,13 +1367,21 @@ def _sync_blocking(owner: str, url: str, username: str = "", password: str = "",
                                     dtend=end_dt,
                                     all_day=all_day,
                                     is_utc=row_is_utc,
+                                    timezone_name=row_timezone,
                                     rrule=rrule,
+                                    recurrence_exdates=json.dumps(
+                                        recurrence_exdates
+                                    ),
                                     origin="caldav",
                                     remote_href=resource_href,
                                     remote_etag=resource_etag,
                                 )
                                 db.add(new_ev)
                                 pending[uid_val] = new_ev
+                                google_claims[uid_val] = (
+                                    local_cal.id,
+                                    resource_href or "",
+                                )
                             result["events"] += 1
                     db.commit()
 
@@ -933,8 +1434,11 @@ def _event_payload(ev) -> dict:
         "dtend": ev.dtend,
         "all_day": ev.all_day,
         "is_utc": ev.is_utc,
+        "timezone": getattr(ev, "timezone_name", "") or "",
         "rrule": ev.rrule or "",
         "recurrence_exdates": json.loads(ev.recurrence_exdates or "[]") if getattr(ev, "recurrence_exdates", "") else [],
+        "remote_href": getattr(ev, "remote_href", "") or "",
+        "remote_etag": getattr(ev, "remote_etag", "") or "",
     }
 
 
@@ -966,7 +1470,11 @@ def _load_delete_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | 
             CalendarDeletedEvent.owner == owner,
         ).first()
         if tombstone:
-            return "caldav", tombstone.calendar_id, {"uid": uid}
+            return "caldav", tombstone.calendar_id, {
+                "uid": uid,
+                "remote_href": getattr(tombstone, "remote_href", "") or "",
+                "remote_etag": getattr(tombstone, "remote_etag", "") or "",
+            }
 
         ev = (
             db.query(CalendarEvent)
@@ -976,7 +1484,11 @@ def _load_delete_for_writeback(owner: str, uid: str) -> tuple[str, str, dict] | 
         )
         if not ev or not ev.calendar or ev.calendar.source != "caldav":
             return None
-        return ev.calendar.source, ev.calendar.id, {"uid": uid}
+        return ev.calendar.source, ev.calendar.id, {
+            "uid": uid,
+            "remote_href": getattr(ev, "remote_href", "") or "",
+            "remote_etag": getattr(ev, "remote_etag", "") or "",
+        }
     finally:
         db.close()
 
@@ -1056,7 +1568,11 @@ def save_caldav_accounts(owner: str, accounts: list) -> None:
 
 
 async def ensure_google_access_token(
-    owner: str, account_id: str, account: dict
+    owner: str,
+    account_id: str,
+    account: dict,
+    *,
+    require_write: bool = True,
 ) -> tuple[str, dict]:
     """Return a usable Google access token and persist refreshes safely.
 
@@ -1071,6 +1587,10 @@ async def ensure_google_access_token(
     expected_auth_type = current.get("auth_type") or "basic"
     if expected_auth_type != "oauth2_google":
         raise RuntimeError("Google account changed while refreshing")
+    from src.google_oauth import has_calendar_write_scope
+    granted_scope = current.get("oauth_scope")
+    if require_write and not has_calendar_write_scope(granted_scope):
+        raise ValueError("Google Calendar permissions changed; reconnect required")
     try:
         access_token = decrypt(current.get("oauth_access_token") or "")
     except Exception as exc:
@@ -1176,8 +1696,31 @@ async def ensure_google_access_token(
     access_token = str(refreshed.get("access_token") or "")
     if not access_token:
         raise RuntimeError("Google token refresh returned no access token")
+    refreshed_scope = refreshed.get("scope")
+    if (
+        require_write
+        and refreshed_scope is not None
+        and not has_calendar_write_scope(refreshed_scope)
+    ):
+        latest_accounts, latest_idx, latest = _reload_matching_account()
+        latest["oauth_access_token"] = ""
+        latest["oauth_refresh_token"] = ""
+        latest["oauth_expires_at"] = 0
+        latest["oauth_scope"] = str(refreshed_scope or "")
+        latest_accounts[latest_idx] = latest
+        try:
+            save_caldav_accounts(owner, latest_accounts)
+        except Exception as exc:
+            logger.exception(
+                "Failed to persist reduced Google scope for account %s",
+                account_id,
+            )
+            raise RuntimeError("Google permissions could not be persisted") from exc
+        raise ValueError("Google Calendar permissions changed; reconnect required")
     current["oauth_access_token"] = encrypt(access_token)
     current["oauth_expires_at"] = refreshed.get("expires_at", 0)
+    if refreshed_scope is not None:
+        current["oauth_scope"] = str(refreshed_scope)
     if refreshed.get("refresh_token"):
         current["oauth_refresh_token"] = encrypt(str(refreshed["refresh_token"]))
 
@@ -1186,6 +1729,8 @@ async def ensure_google_access_token(
 
     latest["oauth_access_token"] = current["oauth_access_token"]
     latest["oauth_expires_at"] = current["oauth_expires_at"]
+    if refreshed_scope is not None:
+        latest["oauth_scope"] = current["oauth_scope"]
     if refreshed.get("refresh_token"):
         latest["oauth_refresh_token"] = current["oauth_refresh_token"]
     latest_accounts[latest_idx] = latest
@@ -1228,7 +1773,12 @@ async def sync_caldav(owner: str) -> dict:
                 totals["errors"].append(f"{label}: {e}")
                 continue
             try:
-                access_token, _updated = await ensure_google_access_token(owner, account_id, acc)
+                access_token, _updated = await ensure_google_access_token(
+                    owner,
+                    account_id,
+                    acc,
+                    require_write=False,
+                )
             except ValueError as exc:
                 if "invalid" in str(exc).lower():
                     totals["errors"].append(
