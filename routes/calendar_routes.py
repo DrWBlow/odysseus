@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import or_, and_
 from dateutil.rrule import rrulestr
@@ -717,11 +718,35 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         return _load_caldav_accounts(owner)
 
     def _save_caldav_accounts(owner: str, accounts: list) -> None:
-        from routes.prefs_routes import _load_for_user, _save_for_user
-        prefs = _load_for_user(owner) or {}
-        prefs["caldav_accounts"] = accounts
-        prefs.pop("caldav", None)
-        _save_for_user(owner, prefs)
+        # Keep CRUD writes on the same persistence path used by token refresh.
+        from src.caldav_sync import save_caldav_accounts
+        save_caldav_accounts(owner, accounts)
+
+    _CALDAV_AUTH_TYPES = {"basic", "oauth2_google"}
+
+    def _account_auth_type(body: dict, current: dict | None = None) -> str:
+        if "auth_type" in body:
+            auth_type = body.get("auth_type")
+        elif current is not None:
+            auth_type = current.get("auth_type") or "basic"
+        else:
+            auth_type = "basic"
+        if not isinstance(auth_type, str) or auth_type not in _CALDAV_AUTH_TYPES:
+            raise HTTPException(400, "Unsupported CalDAV auth_type")
+        return auth_type
+
+    def _validate_account_url(raw_url: str, auth_type: str) -> str:
+        if auth_type == "oauth2_google":
+            from src.caldav_sync import validate_google_caldav_url
+            return validate_google_caldav_url(raw_url)
+        from src.caldav_sync import validate_caldav_url
+        return validate_caldav_url(raw_url)
+
+    def _invalidate_google_tokens(account: dict) -> None:
+        """Require a fresh Google grant after OAuth client credentials change."""
+        account["oauth_access_token"] = ""
+        account["oauth_refresh_token"] = ""
+        account["oauth_expires_at"] = 0
 
     # ── CalDAV config routes (backward-compat single-account API) ────────────
 
@@ -784,52 +809,107 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
 
     @router.get("/config/accounts")
     async def list_caldav_accounts(request: Request):
-        """Return all configured CalDAV accounts (passwords never returned)."""
+        """Return all configured CalDAV accounts (secrets never returned)."""
         owner = _require_user(request)
         accounts = _get_caldav_accounts(owner)
+        from src.secret_storage import decrypt
+
+        def _has_secret(
+            value, account_id: str, field: str, *, allow_plaintext: bool = False
+        ) -> bool:
+            if not isinstance(value, str) or not value:
+                return False
+            try:
+                return bool(decrypt(value))
+            except Exception:
+                logger.warning("Could not inspect stored CalDAV %s for account %s", field, account_id)
+                # Basic passwords predate encrypted storage and may still be
+                # legacy plaintext. OAuth bearer/client fields never get this
+                # fallback: treating corrupt ciphertext as connected is unsafe.
+                return allow_plaintext
+
         safe = []
         for acc in accounts:
-            pw = acc.get("password") or ""
-            has_pw = False
-            if pw:
-                try:
-                    from src.secret_storage import decrypt
-                    has_pw = bool(decrypt(pw))
-                except Exception:
-                    has_pw = bool(pw)
-            safe.append({
-                "id": acc.get("id", ""),
-                "label": acc.get("label", "") or acc.get("url", ""),
-                "url": acc.get("url", "") or "",
-                "username": acc.get("username", "") or "",
-                "has_password": has_pw,
-            })
+            auth_type = acc.get("auth_type") or "basic"
+            if auth_type == "oauth2_google":
+                has_token = _has_secret(acc.get("oauth_access_token"), acc.get("id", ""), "access token")
+                is_connected = _has_secret(acc.get("oauth_refresh_token"), acc.get("id", ""), "refresh token")
+                safe.append({
+                    "id": acc.get("id", ""),
+                    "label": acc.get("label", "") or acc.get("url", ""),
+                    "url": acc.get("url", "") or "",
+                    "username": "",
+                    "has_password": False,
+                    "auth_type": "oauth2_google",
+                    "has_access_token": has_token,
+                    "is_connected": is_connected,
+                    # Client ID is not a secret and is needed to edit or
+                    # reconnect an existing account.  Never return the
+                    # encrypted client secret or bearer tokens.
+                    "oauth_client_id": acc.get("oauth_client_id", "") or "",
+                })
+            else:
+                pw = acc.get("password") or ""
+                has_pw = _has_secret(
+                    pw, acc.get("id", ""), "password", allow_plaintext=True
+                )
+                safe.append({
+                    "id": acc.get("id", ""),
+                    "label": acc.get("label", "") or acc.get("url", ""),
+                    "url": acc.get("url", "") or "",
+                    "username": acc.get("username", "") or "",
+                    "has_password": has_pw,
+                    "auth_type": "basic",
+                    "has_access_token": False,
+                    "is_connected": has_pw,
+                })
         return {"accounts": safe}
 
     @router.post("/config/accounts")
     async def add_caldav_account(request: Request):
-        """Add a new CalDAV account."""
+        """Add a new CalDAV account (basic auth or Google OAuth)."""
         import uuid as _uuid
         owner = _require_user(request)
         try:
             body = await request.json()
         except Exception:
             body = {}
-        from src.caldav_sync import validate_caldav_url
+        auth_type = _account_auth_type(body)
+        raw_url = body.get("url", "")
+        raw_label = body.get("label")
+        if not isinstance(raw_url, str):
+            raise HTTPException(400, "URL must be a string")
+        if raw_label is not None and not isinstance(raw_label, str):
+            raise HTTPException(400, "Label must be a string")
         try:
-            url = validate_caldav_url(body.get("url", ""))
+            url = _validate_account_url(raw_url, auth_type)
         except ValueError as e:
             raise HTTPException(400, str(e))
-        if not body.get("password"):
-            raise HTTPException(400, "Password is required")
         from src.secret_storage import encrypt
-        new_acc = {
+        new_acc: dict = {
             "id": str(_uuid.uuid4()),
-            "label": (body.get("label") or "").strip() or "CalDAV",
+            "label": (raw_label or "").strip() or "CalDAV",
             "url": url,
-            "username": (body.get("username") or "").strip(),
-            "password": encrypt(body["password"]),
+            "auth_type": auth_type,
         }
+        if auth_type == "oauth2_google":
+            if not body.get("oauth_client_id"):
+                raise HTTPException(400, "Client ID is required")
+            if not body.get("oauth_client_secret"):
+                raise HTTPException(400, "Client Secret is required")
+            if not isinstance(body.get("oauth_client_id"), str):
+                raise HTTPException(400, "Client ID is required")
+            new_acc["oauth_client_id"] = body["oauth_client_id"].strip()
+            if not new_acc["oauth_client_id"]:
+                raise HTTPException(400, "Client ID is required")
+            if not isinstance(body.get("oauth_client_secret"), str):
+                raise HTTPException(400, "Client Secret is required")
+            new_acc["oauth_client_secret"] = encrypt(body["oauth_client_secret"])
+        else:
+            if not body.get("password"):
+                raise HTTPException(400, "Password is required")
+            new_acc["username"] = (body.get("username") or "").strip()
+            new_acc["password"] = encrypt(body["password"])
         accounts = _get_caldav_accounts(owner)
         accounts.append(new_acc)
         _save_caldav_accounts(owner, accounts)
@@ -848,19 +928,85 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         if idx is None:
             raise HTTPException(404, "Account not found")
         acc = dict(accounts[idx])
+        auth_type = _account_auth_type(body, acc)
+        old_auth_type = acc.get("auth_type") or "basic"
+        old_url = acc.get("url") or ""
+        if "url" in body and not isinstance(body["url"], str):
+            raise HTTPException(400, "URL must be a string")
+        if "label" in body and not isinstance(body["label"], str):
+            raise HTTPException(400, "Label must be a string")
         if body.get("url"):
-            from src.caldav_sync import validate_caldav_url
-            try:
-                acc["url"] = validate_caldav_url(body["url"])
-            except ValueError as e:
-                raise HTTPException(400, str(e))
+            acc["url"] = body["url"]
         if body.get("label") is not None:
             acc["label"] = (body.get("label") or "").strip() or "CalDAV"
-        if body.get("username") is not None:
-            acc["username"] = (body.get("username") or "").strip()
-        if body.get("password"):
-            from src.secret_storage import encrypt
-            acc["password"] = encrypt(body["password"])
+        acc["auth_type"] = auth_type
+
+        from src.secret_storage import decrypt, encrypt
+        old_client_id = acc.get("oauth_client_id") or ""
+        old_client_id = old_client_id.strip() if isinstance(old_client_id, str) else ""
+        old_secret_stored = acc.get("oauth_client_secret") or ""
+        old_client_secret = None
+        if old_secret_stored:
+            try:
+                old_client_secret = decrypt(old_secret_stored)
+            except Exception:
+                # A malformed stored secret is already unusable; changing it
+                # must invalidate any tokens rather than preserving them.
+                old_client_secret = None
+        google_credentials_changed = old_auth_type != auth_type
+        if old_auth_type != auth_type:
+            # A deliberate auth-type switch must not retain credentials for the
+            # previous scheme, which could otherwise be selected accidentally.
+            stale = (
+                ("username", "password")
+                if auth_type == "oauth2_google"
+                else (
+                    "oauth_client_id", "oauth_client_secret", "oauth_access_token",
+                    "oauth_refresh_token", "oauth_expires_at",
+                )
+            )
+            for key in stale:
+                acc.pop(key, None)
+        if auth_type == "oauth2_google":
+            if body.get("oauth_client_id"):
+                if not isinstance(body["oauth_client_id"], str):
+                    raise HTTPException(400, "Client ID is required")
+                acc["oauth_client_id"] = body["oauth_client_id"].strip()
+                google_credentials_changed = (
+                    google_credentials_changed
+                    or acc["oauth_client_id"] != old_client_id
+                )
+            if not (acc.get("oauth_client_id") or "").strip():
+                raise HTTPException(400, "Client ID is required")
+            if body.get("oauth_client_secret"):
+                if not isinstance(body["oauth_client_secret"], str):
+                    raise HTTPException(400, "Client Secret is required")
+                google_credentials_changed = (
+                    google_credentials_changed
+                    or old_client_secret != body["oauth_client_secret"]
+                )
+                acc["oauth_client_secret"] = encrypt(body["oauth_client_secret"])
+            if not acc.get("oauth_client_secret"):
+                raise HTTPException(400, "Client Secret is required")
+        else:
+            if body.get("username") is not None:
+                acc["username"] = (body.get("username") or "").strip()
+            if body.get("password"):
+                acc["password"] = encrypt(body["password"])
+            if old_auth_type != auth_type and not acc.get("password"):
+                raise HTTPException(400, "Password is required when switching to basic auth")
+        try:
+            # Validate both edited and retained URLs against the selected auth
+            # scheme before persisting the account.
+            acc["url"] = _validate_account_url(acc.get("url", ""), auth_type)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        google_credentials_changed = (
+            google_credentials_changed
+            or (auth_type == "oauth2_google" and acc["url"] != old_url.rstrip("/"))
+        )
+        if auth_type == "oauth2_google" and google_credentials_changed:
+            _invalidate_google_tokens(acc)
         accounts[idx] = acc
         _save_caldav_accounts(owner, accounts)
         return {"ok": True}
@@ -876,6 +1022,193 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         _save_caldav_accounts(owner, new_accounts)
         return {"ok": True}
 
+    # ── Google OAuth for CalDAV ───────────────────────────────────────────────
+
+    @router.get("/oauth/google/start")
+    async def google_oauth_start(request: Request, account_id: str):
+        """Redirect the user to Google's OAuth consent screen."""
+        owner = _require_user(request)
+        accounts = _get_caldav_accounts(owner)
+        acc = next((a for a in accounts if a.get("id") == account_id), None)
+        if not acc or acc.get("auth_type") != "oauth2_google":
+            raise HTTPException(400, "Account not found or not a Google OAuth account")
+        client_id = acc.get("oauth_client_id") or ""
+        if not client_id:
+            raise HTTPException(400, "No Client ID configured for this account")
+        try:
+            _validate_account_url(acc.get("url", ""), "oauth2_google")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        from src.google_oauth import generate_state, build_auth_url, get_redirect_uri
+        state = generate_state(owner, account_id)
+        redirect_uri = get_redirect_uri()
+        auth_url = build_auth_url(client_id, redirect_uri, state)
+        return RedirectResponse(auth_url)
+
+    @router.get("/oauth/google/callback")
+    async def google_oauth_callback(
+        request: Request,
+        code: str = "",
+        state: str = "",
+        error: str = "",
+    ):
+        """Handle Google's OAuth redirect, exchange code for tokens, and save."""
+        owner = _require_user(request)
+        if error:
+            # Consume the state even when Google reports a user denial so the
+            # callback cannot be replayed with a later code.
+            from src.google_oauth import consume_state
+            consume_state(state, owner=owner)
+            logger.warning("Google OAuth was denied: %r", str(error)[:200])
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google auth was not completed</h2>"
+                "<p>Please try connecting again from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        from src.google_oauth import consume_state, exchange_code, get_redirect_uri
+        pending = consume_state(state, owner=owner)
+        if not pending:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Invalid or expired OAuth state</h2>"
+                "<p>Please try connecting again from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        if not code:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google auth response was incomplete</h2>"
+                "<p>Please try connecting again from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        account_id = pending["account_id"]
+        accounts = _get_caldav_accounts(owner)
+        idx = next((i for i, a in enumerate(accounts) if a.get("id") == account_id), None)
+        if idx is None or accounts[idx].get("auth_type") != "oauth2_google":
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account is no longer available</h2>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        acc = dict(accounts[idx])
+        try:
+            _validate_account_url(acc.get("url", ""), "oauth2_google")
+        except ValueError:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account configuration is invalid</h2>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        client_id = acc.get("oauth_client_id") or ""
+        if not isinstance(client_id, str) or not client_id.strip():
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account configuration is invalid</h2>"
+                "<p>Please check the Client ID and reconnect from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        client_id = client_id.strip()
+        from src.secret_storage import decrypt, encrypt
+        try:
+            client_secret = decrypt(acc.get("oauth_client_secret") or "")
+        except Exception as exc:
+            logger.warning(
+                "Could not decrypt Google client secret for account %s: %s",
+                account_id,
+                type(exc).__name__,
+            )
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account configuration is invalid</h2>"
+                "<p>Please check the Client Secret and reconnect from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        if not isinstance(client_secret, str) or not client_secret:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account configuration is invalid</h2>"
+                "<p>Please check the Client Secret and reconnect from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=400,
+            )
+        expected_secret_stored = acc.get("oauth_client_secret") or ""
+        redirect_uri = get_redirect_uri()
+        try:
+            tokens = await exchange_code(client_id, client_secret, code, redirect_uri)
+        except Exception as e:
+            logger.warning("Google OAuth token exchange failed: %s", type(e).__name__)
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Token exchange failed</h2>"
+                "<p>Google could not complete the connection. Please try again.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=500,
+            )
+        # The token exchange awaits a network request. Reload before writing so
+        # a concurrent account edit is not replaced by the stale pre-exchange
+        # list, and do not attach Google tokens after an auth-type switch.
+        accounts = _get_caldav_accounts(owner)
+        idx = next((i for i, a in enumerate(accounts) if a.get("id") == account_id), None)
+        if idx is None or accounts[idx].get("auth_type") != "oauth2_google":
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account changed while connecting</h2>"
+                "<p>Please reconnect from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=409,
+            )
+        acc = dict(accounts[idx])
+        current_client_id = acc.get("oauth_client_id") or ""
+        current_secret_stored = acc.get("oauth_client_secret") or ""
+        if current_client_id != client_id or current_secret_stored != expected_secret_stored:
+            return HTMLResponse(
+                "<html><body style='font-family:sans-serif;padding:40px'>"
+                "<h2>Google account credentials changed while connecting</h2>"
+                "<p>Please reconnect from Settings.</p>"
+                "<a href='/'>Back to Odysseus</a></body></html>",
+                status_code=409,
+            )
+        returned_refresh_token = tokens.get("refresh_token")
+        stored_refresh_token = acc.get("oauth_refresh_token") or ""
+        if returned_refresh_token:
+            acc["oauth_refresh_token"] = encrypt(returned_refresh_token)
+        else:
+            try:
+                has_stored_refresh_token = bool(
+                    isinstance(stored_refresh_token, str)
+                    and stored_refresh_token.strip()
+                    and decrypt(stored_refresh_token)
+                )
+            except Exception:
+                has_stored_refresh_token = False
+            if not has_stored_refresh_token:
+                return HTMLResponse(
+                    "<html><body style='font-family:sans-serif;padding:40px'>"
+                    "<h2>Google did not return a refresh token</h2>"
+                    "<p>Please reconnect and grant offline calendar access.</p>"
+                    "<a href='/'>Back to Odysseus</a></body></html>",
+                    status_code=400,
+                )
+        acc["oauth_access_token"] = encrypt(tokens["access_token"])
+        acc["oauth_expires_at"] = tokens["expires_at"]
+        accounts[idx] = acc
+        _save_caldav_accounts(owner, accounts)
+        return HTMLResponse(
+            "<html><head><meta http-equiv='refresh' content='2;url=/'></head>"
+            "<body style='font-family:sans-serif;text-align:center;padding:60px'>"
+            "<h2>&#10003; Google Calendar connected!</h2>"
+            "<p>Redirecting back to Odysseus&hellip;</p>"
+            "</body></html>"
+        )
+
     @router.post("/test")
     async def test_connection(request: Request):
         """Probe a CalDAV server with a PROPFIND. Accepts an optional body:
@@ -887,6 +1220,72 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             body = await request.json()
         except Exception:
             body = {}
+
+        import httpx
+        propfind_body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
+            '</d:prop></d:propfind>'
+        )
+
+        # OAuth account test — just PROPFIND with Bearer token.
+        if body.get("account_id"):
+            accounts = _get_caldav_accounts(owner)
+            acc = next((a for a in accounts if a.get("id") == body["account_id"]), None)
+            if acc and acc.get("auth_type") == "oauth2_google":
+                url = (acc.get("url") or "").strip()
+                if not url:
+                    return {"ok": False, "error": "No URL configured"}
+                from src.caldav_sync import ensure_google_access_token, validate_google_caldav_url
+                try:
+                    url = validate_google_caldav_url(url)
+                except ValueError as e:
+                    return {"ok": False, "error": str(e)}
+                try:
+                    access_token, _updated = await ensure_google_access_token(
+                        owner, body["account_id"], acc
+                    )
+                except ValueError as exc:
+                    if "invalid" in str(exc).lower():
+                        return {
+                            "ok": False,
+                            "error": "Stored Google credentials are invalid — reconnect with Google",
+                        }
+                    return {"ok": False, "error": "Not connected — click 'Connect with Google' first"}
+                except RuntimeError:
+                    return {"ok": False, "error": "Token refresh failed"}
+                except Exception as exc:
+                    logger.warning(
+                        "Could not read stored Google credentials for account %s: %s",
+                        body["account_id"],
+                        type(exc).__name__,
+                    )
+                    return {
+                        "ok": False,
+                        "error": "Stored Google credentials are invalid — reconnect with Google",
+                    }
+                try:
+                    async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False) as cx:
+                        r = await cx.request(
+                            "PROPFIND", url,
+                            headers={"Depth": "0", "Content-Type": "application/xml",
+                                     "Authorization": f"Bearer {access_token}"},
+                            content=propfind_body,
+                        )
+                    if r.status_code in (200, 207):
+                        return {"ok": True}
+                    if r.status_code == 401:
+                        return {"ok": False, "error": "Auth failed — try reconnecting with Google"}
+                    logger.warning("Google CalDAV PROPFIND returned HTTP %s", r.status_code)
+                    return {"ok": False, "error": f"HTTP {r.status_code}"}
+                except httpx.ConnectError as e:
+                    return {"ok": False, "error": f"Connection refused: {e}"[:200]}
+                except httpx.TimeoutException:
+                    return {"ok": False, "error": "Connection timed out"}
+                except Exception as e:
+                    logger.warning("Google CalDAV PROPFIND failed: %s", type(e).__name__)
+                    return {"ok": False, "error": "Connection failed"}
+
         url = (body.get("url") or "").strip()
         user = (body.get("username") or "").strip()
         pw = body.get("password") or ""
@@ -916,12 +1315,6 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             url = validate_caldav_url(url)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
-        import httpx
-        propfind_body = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/>'
-            '</d:prop></d:propfind>'
-        )
         try:
             # Build an SSL context that trusts the operator's custom CA bundle
             # (SSL_CERT_FILE / REQUESTS_CA_BUNDLE) so self-signed CalDAV servers

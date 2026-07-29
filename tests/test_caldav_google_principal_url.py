@@ -74,6 +74,11 @@ class _FakeCalendar:
         return []
 
 
+class _FakeEmptyCalendar(_FakeCalendar):
+    def date_search(self, start, end, expand=False):
+        raise sys.modules["caldav.lib.error"].NotFoundError("404 Not Found No events found.")
+
+
 class _FakePrincipal:
     def calendars(self):
         # Simulate Google's /user endpoint yielding no calendars from discovery.
@@ -98,9 +103,18 @@ class _FakeClient:
         self.closed = True
 
 
+class _FakeEmptyClient(_FakeClient):
+    def calendar(self, url=None):
+        return _FakeEmptyCalendar(url)
+
+
 def _install_fake_caldav(monkeypatch):
+    return _install_fake_caldav_client(monkeypatch, _FakeClient)
+
+
+def _install_fake_caldav_client(monkeypatch, client_cls):
     fake = types.ModuleType("caldav")
-    fake.DAVClient = _FakeClient
+    fake.DAVClient = client_cls
     err = types.ModuleType("caldav.lib.error")
 
     class AuthorizationError(Exception):
@@ -167,3 +181,14 @@ def test_google_sync_pulls_events_instead_of_empty(monkeypatch):
         assert ev is not None and ev.summary == "Standup"
     finally:
         db.close()
+
+
+def test_google_sync_treats_no_events_404_as_empty_success(monkeypatch):
+    _install_fake_caldav_client(monkeypatch, _FakeEmptyClient)
+    _clear_db()
+
+    result = caldav_sync._sync_blocking("alice", _GOOGLE_PRINCIPAL, "me@gmail.com", "app-pw")
+
+    assert result["calendars"] == 1, result
+    assert result["events"] == 0, result
+    assert not result["errors"], result["errors"]
